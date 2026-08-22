@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+MetaTrader5
+pandas
+ta
+python-dotenv
+requests
+jinja2
+psutil
