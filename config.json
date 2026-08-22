@@ -19,7 +19,7 @@
     "enableDCA": true,
     "dcaStepATR": 1.0,
     "dcaMultiplier": 1.5,
-    "maxDCA": 3,
+    "maxDCA": 5,
     "dcaTargetProfit": 0.5,
     "maxBasketRisk": 5.0,
     "hardCutRisk": 6.0,

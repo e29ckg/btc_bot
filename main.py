@@ -28,7 +28,7 @@ CONFIG = {
     "adxLen": 14, "adxThresh": 25.0, "minWickPct": 5.0,
     "atrLen": 14, "atrMultiplier": 1.5, "rrRatio": 2.0, "riskPercent": 1.0,
     "magicNumber": 777777,
-    "enableBE": True, "beTriggerATR": 2.0, "beProfitPoints": 20.0, # <-- เพิ่มเป้าหมายกำไรตอนบังหน้าทุน
+    "enableBE": True, "beTriggerATR": 2.0, "beProfitPoints": 20.0,
     "enableTrailing": True, "trailStartATR": 3.0, "trailDistanceATR": 1.0,
     "enableDCA": True, "dcaStepATR": 4.0, "dcaMultiplier": 1.5, "maxDCA": 3,
     "dcaTargetProfit": 3.0,
@@ -68,7 +68,7 @@ class ConfigModel(BaseModel):
     adxLen: int; adxThresh: float; minWickPct: float
     atrLen: int; atrMultiplier: float; rrRatio: float; riskPercent: float
     magicNumber: int
-    enableBE: bool; beTriggerATR: float; beProfitPoints: float # <-- เพิ่ม
+    enableBE: bool; beTriggerATR: float; beProfitPoints: float
     enableTrailing: bool; trailStartATR: float; trailDistanceATR: float
     enableDCA: bool; dcaStepATR: float; dcaMultiplier: float; maxDCA: int
     dcaTargetProfit: float 
@@ -279,15 +279,13 @@ def execute_trade(symbol, action, lot, price, sl, tp, comment):
     send_telegram(f"❌ *AUTO-TRADE FAILED*\nพยายามยิงคำสั่ง {max_retries} ครั้งแต่ล้มเหลว\nเหตุผล: {error_msg}")
     return False
 
-# 🛠️ ปรับฟังก์ชันบังหน้าทุนใหม่ ให้บวกระยะกำไรเพิ่มเข้าไปด้วย
 def move_sl_to_breakeven(ticket, open_price, tp, symbol, type):
     sym_info = mt5.symbol_info(symbol)
     point = sym_info.point
-    extra_pts = CONFIG.get("beProfitPoints", 20.0) # ดึงค่าจาก Config
+    extra_pts = CONFIG.get("beProfitPoints", 20.0) 
     
-    # คำนวณราคาบังหน้าทุนพร้อมบวกกำไรตามที่ระบุ
     be_price = open_price + (extra_pts * point) if type == mt5.ORDER_TYPE_BUY else open_price - (extra_pts * point)
-    be_price = round(be_price, sym_info.digits) # ปัดเศษให้ตรงกับทศนิยมของโบรกเกอร์
+    be_price = round(be_price, sym_info.digits) 
     
     req = {
         "action": mt5.TRADE_ACTION_SLTP, "symbol": symbol, "position": ticket,
@@ -367,7 +365,6 @@ def trade_manager(curr_atr):
 
         curr_price = mt5.symbol_info_tick(SYMBOL).bid if o_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(SYMBOL).ask
         
-        # --- เช็คเงื่อนไข Break-Even ---
         if CONFIG.get("enableBE", True) and sym_info:
             for p in group:
                 profit_dist = (curr_price - p.price_open) if o_type == mt5.ORDER_TYPE_BUY else (p.price_open - curr_price)
@@ -377,13 +374,11 @@ def trade_manager(curr_atr):
                     be_price = p.price_open + (extra_pts * point) if o_type == mt5.ORDER_TYPE_BUY else p.price_open - (extra_pts * point)
                     be_price = round(be_price, sym_info.digits)
                     
-                    # ตรวจสอบว่ายังไม่ได้เลื่อน SL มาที่ตำแหน่งนี้ (เพื่อป้องกันการยิงคำสั่งซ้ำๆ)
                     if o_type == mt5.ORDER_TYPE_BUY and p.sl < be_price:
                         move_sl_to_breakeven(p.ticket, p.price_open, p.tp, SYMBOL, o_type)
                     elif o_type == mt5.ORDER_TYPE_SELL and (p.sl > be_price or p.sl == 0):
                         move_sl_to_breakeven(p.ticket, p.price_open, p.tp, SYMBOL, o_type)
 
-        # --- เช็คเงื่อนไข Trailing Stop ---
         if CONFIG.get("enableTrailing", True) and sym_info:
             digits = sym_info.digits
             for p in group:
@@ -398,7 +393,6 @@ def trade_manager(curr_atr):
                         if (p.sl == 0 or new_sl < p.sl - (curr_atr * 0.1)) and new_sl > curr_price:
                             move_trailing_stop(p.ticket, new_sl, p.tp, SYMBOL)
 
-        # --- เช็คเงื่อนไข DCA ---
         if CONFIG["enableDCA"] and len(group) <= CONFIG["maxDCA"]:
             if is_news_blocked: continue
             last_p = sorted(group, key=lambda x: x.time)[-1]
@@ -431,13 +425,16 @@ def analyze_data():
     curr = df.iloc[-2]
     prev = df.iloc[-3]
 
-    isUptrend, isDowntrend = curr['emaFast'] > curr['emaSlow'], curr['emaFast'] < curr['emaSlow']
-    isTrending = curr['adx'] > CONFIG['adxThresh']
-    buyTrigger = (curr['close'] > curr['emaEntry']) and (prev['close'] <= prev['emaEntry'])
-    sellTrigger = (curr['close'] < curr['emaEntry']) and (prev['close'] >= prev['emaEntry'])
+    # 🔒 บังคับผลลัพธ์ให้เป็น True/False แบบ 100% (Bulletproof)
+    isUptrend = bool(curr['emaFast'] > curr['emaSlow'])
+    isDowntrend = bool(curr['emaFast'] < curr['emaSlow'])
+    isTrending = bool(curr['adx'] > CONFIG.get('adxThresh', 20.0))
+    
+    buyTrigger = bool((curr['close'] > curr['emaEntry']) and (prev['close'] <= prev['emaEntry']))
+    sellTrigger = bool((curr['close'] < curr['emaEntry']) and (prev['close'] >= prev['emaEntry']))
 
-    buySignal = isUptrend and isTrending and buyTrigger and (curr['lowerWickPct'] >= CONFIG['minWickPct'])
-    sellSignal = isDowntrend and isTrending and sellTrigger and (curr['upperWickPct'] >= CONFIG['minWickPct'])
+    buySignal = bool(isUptrend and isTrending and buyTrigger and (curr['lowerWickPct'] >= CONFIG.get('minWickPct', 5.0)))
+    sellSignal = bool(isDowntrend and isTrending and sellTrigger and (curr['upperWickPct'] >= CONFIG.get('minWickPct', 5.0)))
 
     raw_signal = "BUY" if buySignal else "SELL" if sellSignal else "WAIT"
     is_filter_passed, filter_reason = check_market_filters(raw_signal)
@@ -689,3 +686,19 @@ def close_all_orders():
 def get_status():
     analyze_data()
     return get_dashboard_data()
+
+# ==========================================
+# 📈 API สำหรับดึงประวัติการเทรดมาแสดงผล
+# ==========================================
+@app.get("/api/logs")
+def get_trade_logs():
+    if not os.path.exists(TRADE_LOG_FILE):
+        return {"status": "success", "logs": []}
+    try:
+        df = pd.read_csv(TRADE_LOG_FILE)
+        # ดึง 50 รายการล่าสุด และกลับด้านให้รายการใหม่สุดอยู่บน
+        last_logs = df.tail(50).fillna("").to_dict(orient="records")
+        last_logs.reverse()
+        return {"status": "success", "logs": last_logs}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
