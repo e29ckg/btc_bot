@@ -5,6 +5,9 @@ env/
 # Environment variables (ห้ามอัปโหลดไฟล์นี้เด็ดขาด!)
 .env
 
+#
+trade_log.csv
+
 # Python cache
 __pycache__/
 *.pyc
