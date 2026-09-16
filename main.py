@@ -244,7 +244,7 @@ def send_telegram(message: str):
         response.raise_for_status()
         return True
     except requests.RequestException as exc:
-        print(f"Telegram notification failed: {exc}")
+        print(f"Telegram notification failed: {type(exc).__name__}")
         return False
 
 def log_trade(ticket, action_str, symbol, volume, price, reason, profit=0.0):
