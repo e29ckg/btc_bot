@@ -3,6 +3,9 @@ import time
 import json
 import csv
 import asyncio
+import base64
+import math
+import secrets
 import requests
 import MetaTrader5 as mt5
 import pandas as pd
@@ -10,18 +13,22 @@ import ta
 import psutil
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel 
+from pydantic import BaseModel, Field, model_validator
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSD")
 TIMEFRAME_STR = os.getenv("TIMEFRAME", "M1")
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
 
 CONFIG_FILE = "config.json"
 TRADE_LOG_FILE = "trade_log.csv"
+RUNTIME_STATE_FILE = "runtime_state.json"
 
 CONFIG = {
     "emaFastLen": 50, "emaSlowLen": 100, "emaEntryLen": 8,
@@ -64,36 +71,133 @@ def save_config():
 load_config()
 
 class ConfigModel(BaseModel):
-    emaFastLen: int; emaSlowLen: int; emaEntryLen: int
-    adxLen: int; adxThresh: float; minWickPct: float
-    atrLen: int; atrMultiplier: float; rrRatio: float; riskPercent: float
-    magicNumber: int
-    enableBE: bool; beTriggerATR: float; beProfitPoints: float
-    enableTrailing: bool; trailStartATR: float; trailDistanceATR: float
-    enableDCA: bool; dcaStepATR: float; dcaMultiplier: float; maxDCA: int
-    dcaTargetProfit: float 
-    maxBasketRisk: float; hardCutRisk: float; maxDailyDrawdownRisk: float
-    enableNewsFilter: bool; newsBeforeMin: int; newsAfterMin: int
-    enableMTFFilter: bool; maxSpreadPoints: float
-    enableSessionFilter: bool; sessionStartHour: int; sessionEndHour: int
+    emaFastLen: int = Field(ge=2, le=500)
+    emaSlowLen: int = Field(ge=3, le=1000)
+    emaEntryLen: int = Field(ge=2, le=200)
+    adxLen: int = Field(ge=2, le=200)
+    adxThresh: float = Field(ge=1, le=100)
+    minWickPct: float = Field(ge=0, le=100)
+    atrLen: int = Field(ge=2, le=200)
+    atrMultiplier: float = Field(gt=0, le=20)
+    rrRatio: float = Field(gt=0, le=20)
+    riskPercent: float = Field(gt=0, le=2)
+    magicNumber: int = Field(gt=0)
+    enableBE: bool
+    beTriggerATR: float = Field(gt=0, le=20)
+    beProfitPoints: float = Field(ge=0, le=10000)
+    enableTrailing: bool
+    trailStartATR: float = Field(gt=0, le=20)
+    trailDistanceATR: float = Field(gt=0, le=20)
+    enableDCA: bool
+    dcaStepATR: float = Field(ge=1, le=20)
+    dcaMultiplier: float = Field(ge=1, le=2)
+    maxDCA: int = Field(ge=0, le=5)
+    dcaTargetProfit: float = Field(ge=0)
+    maxBasketRisk: float = Field(gt=0, le=5)
+    hardCutRisk: float = Field(gt=0, le=6)
+    maxDailyDrawdownRisk: float = Field(gt=0, le=10)
+    enableNewsFilter: bool
+    newsBeforeMin: int = Field(ge=0, le=240)
+    newsAfterMin: int = Field(ge=0, le=240)
+    enableMTFFilter: bool
+    maxSpreadPoints: float = Field(gt=0, le=500)
+    enableSessionFilter: bool
+    sessionStartHour: int = Field(ge=0, le=23)
+    sessionEndHour: int = Field(ge=0, le=23)
+
+    @model_validator(mode="after")
+    def validate_risk_relationships(self):
+        if self.emaFastLen >= self.emaSlowLen:
+            raise ValueError("emaFastLen must be less than emaSlowLen")
+        if self.maxBasketRisk > self.hardCutRisk:
+            raise ValueError("maxBasketRisk must not exceed hardCutRisk")
+        if self.enableSessionFilter and self.sessionStartHour == self.sessionEndHour:
+            raise ValueError("session window cannot be zero hours")
+        return self
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
+MUTATING_PATHS = {"/api/config", "/api/start", "/api/stop", "/api/toggle_auto", "/api/close_all"}
+
+@app.middleware("http")
+async def dashboard_security(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+    if not DASHBOARD_PASSWORD:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Set DASHBOARD_PASSWORD in .env before exposing the dashboard."},
+        )
+    auth = request.headers.get("Authorization", "")
+    try:
+        scheme, encoded = auth.split(" ", 1)
+        username, password = base64.b64decode(encoded).decode("utf-8").split(":", 1)
+    except (ValueError, UnicodeDecodeError):
+        scheme, username, password = "", "", ""
+    valid = (
+        scheme.lower() == "basic"
+        and secrets.compare_digest(username, DASHBOARD_USERNAME)
+        and secrets.compare_digest(password, DASHBOARD_PASSWORD)
+    )
+    if not valid:
+        return PlainTextResponse(
+            "Authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="MASTER 7 Bot"'},
+        )
+    if request.url.path in MUTATING_PATHS:
+        if request.method != "POST" or request.headers.get("X-Bot-Action") != "confirm":
+            return JSONResponse(status_code=405, content={"detail": "Confirmed POST request required."})
+    return await call_next(request)
+
 bot_state = {
     "is_running": False, "auto_trade": False, "latest_price": 0,
     "signal": "WAIT", "last_update": "", "indicators": {},
-    "tp": 0.0, "sl": 0.0, "lot": 0.0,
+    "tp": 0.0, "sl": 0.0, "sl_distance": 0.0, "lot": 0.0,
     "news_status": {"is_blocked": False, "reason": "No major news near", "next_news": "-"},
-    "market_filter_status": {"is_filtered": False, "reason": "All conditions clear"}
+    "market_filter_status": {"is_filtered": False, "reason": "All conditions clear"},
+    "daily_lockout_date": None,
 }
 
 known_tickets = set()
 cached_news = []
+news_last_updated = None
+bot_task = None
+last_signal_candle = None
+
+def load_runtime_state():
+    try:
+        with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as state_file:
+            saved = json.load(state_file)
+        bot_state["daily_lockout_date"] = saved.get("daily_lockout_date")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        bot_state["daily_lockout_date"] = None
+
+def save_runtime_state():
+    try:
+        with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as state_file:
+            json.dump({"daily_lockout_date": bot_state.get("daily_lockout_date")}, state_file)
+    except OSError as exc:
+        print(f"Runtime state save failed: {exc}")
+
+load_runtime_state()
 
 def send_telegram(message: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"})
+    try:
+        response = requests.post(
+            url,
+            json={"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        print(f"Telegram notification failed: {exc}")
+        return False
 
 def log_trade(ticket, action_str, symbol, volume, price, reason, profit=0.0):
     file_exists = os.path.isfile(TRADE_LOG_FILE)
@@ -137,17 +241,23 @@ async def mt5_connection_monitor():
         await asyncio.sleep(10)
 
 def fetch_economic_calendar():
-    global cached_news
+    global cached_news, news_last_updated
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     try:
         res = requests.get(url, timeout=10)
-        if res.status_code == 200: cached_news = res.json()
+        if res.status_code == 200:
+            cached_news = res.json()
+            news_last_updated = datetime.now(timezone.utc)
     except Exception as e: print(f"Error fetching economic calendar: {e}")
 
 def check_news_impact():
-    if not CONFIG.get("enableNewsFilter", True) or not cached_news:
+    if not CONFIG.get("enableNewsFilter", True):
         bot_state["news_status"] = {"is_blocked": False, "reason": "News filter disabled", "next_news": "-"}
         return False
+    cache_stale = not news_last_updated or datetime.now(timezone.utc) - news_last_updated > timedelta(hours=2)
+    if not cached_news or cache_stale:
+        bot_state["news_status"] = {"is_blocked": True, "reason": "News calendar unavailable or stale", "next_news": "-"}
+        return True
     now_utc = datetime.now(timezone.utc)
     before_delta = timedelta(minutes=CONFIG.get("newsBeforeMin", 30))
     after_delta = timedelta(minutes=CONFIG.get("newsAfterMin", 30))
@@ -191,26 +301,29 @@ def get_mt5_timeframe(tf_str):
 def check_market_filters(proposed_signal: str):
     tick = mt5.symbol_info_tick(SYMBOL)
     sym_info = mt5.symbol_info(SYMBOL)
-    if tick and sym_info and sym_info.point > 0:
-        spread_points = (tick.ask - tick.bid) / sym_info.point
-        if spread_points > CONFIG.get("maxSpreadPoints", 50.0):
-            return False, f"High Spread: {spread_points:.1f} pts (Max {CONFIG['maxSpreadPoints']})"
+    if not tick or not sym_info or sym_info.point <= 0:
+        return False, "Market data unavailable"
+    spread_points = (tick.ask - tick.bid) / sym_info.point
+    if spread_points > CONFIG.get("maxSpreadPoints", 50.0):
+        return False, f"High Spread: {spread_points:.1f} pts (Max {CONFIG['maxSpreadPoints']})"
 
     if CONFIG.get("enableSessionFilter", False):
         current_hour = datetime.now().hour
         start_h = CONFIG.get("sessionStartHour", 13)
         end_h = CONFIG.get("sessionEndHour", 23)
-        if not (start_h <= current_hour < end_h):
+        in_session = start_h <= current_hour < end_h if start_h < end_h else current_hour >= start_h or current_hour < end_h
+        if not in_session:
             return False, f"Outside Session Window ({start_h}:00 - {end_h}:00)"
 
     if CONFIG.get("enableMTFFilter", True) and proposed_signal in ["BUY", "SELL"]:
         h1_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, 120)
-        if h1_rates is not None and len(h1_rates) >= 100:
-            df_h1 = pd.DataFrame(h1_rates)
-            ema50_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaFastLen']).iloc[-1]
-            ema100_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaSlowLen']).iloc[-1]
-            if proposed_signal == "BUY" and ema50_h1 <= ema100_h1: return False, "H1 Trend is Bearish"
-            elif proposed_signal == "SELL" and ema50_h1 >= ema100_h1: return False, "H1 Trend is Bullish"
+        if h1_rates is None or len(h1_rates) < max(CONFIG['emaFastLen'], CONFIG['emaSlowLen']):
+            return False, "H1 market data unavailable"
+        df_h1 = pd.DataFrame(h1_rates)
+        ema50_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaFastLen']).iloc[-2]
+        ema100_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaSlowLen']).iloc[-2]
+        if proposed_signal == "BUY" and ema50_h1 <= ema100_h1: return False, "H1 Trend is Bearish"
+        elif proposed_signal == "SELL" and ema50_h1 >= ema100_h1: return False, "H1 Trend is Bullish"
 
     return True, "Passed All Filters"
 
@@ -226,8 +339,10 @@ def calculate_lot_size(symbol: str, sl_points: float, risk_percent: float):
     point_value = tick_value / (tick_size / sym_info.point)
     if point_value <= 0: return 0.0
     raw_lot = risk_amount / (sl_points * point_value)
-    lot = round(raw_lot / sym_info.volume_step) * sym_info.volume_step
-    return max(sym_info.volume_min, min(lot, sym_info.volume_max))
+    if sym_info.volume_step <= 0: return 0.0
+    lot = math.floor(raw_lot / sym_info.volume_step) * sym_info.volume_step
+    if lot < sym_info.volume_min: return 0.0
+    return round(min(lot, sym_info.volume_max), 8)
 
 def calculate_safe_dca_lot(symbol, group, curr_atr):
     acc_info = mt5.account_info()
@@ -250,33 +365,82 @@ def calculate_safe_dca_lot(symbol, group, curr_atr):
     last_lot = sorted(group, key=lambda x: x.time)[-1].volume
     normal_dca_lot = last_lot * CONFIG["dcaMultiplier"]
     final_lot = min(normal_dca_lot, safe_lot)
-    final_lot = round(final_lot / sym_info.volume_step) * sym_info.volume_step
-    return max(sym_info.volume_min, min(final_lot, sym_info.volume_max))
+    if sym_info.volume_step <= 0: return 0.0
+    final_lot = math.floor(final_lot / sym_info.volume_step) * sym_info.volume_step
+    if final_lot < sym_info.volume_min: return 0.0
+    return round(min(final_lot, sym_info.volume_max), 8)
+
+def calculate_basket_emergency_sl(symbol, group, new_lot, current_price, order_type):
+    acc_info = mt5.account_info()
+    sym_info = mt5.symbol_info(symbol)
+    if not acc_info or not sym_info or sym_info.point <= 0 or sym_info.trade_tick_size <= 0:
+        return 0.0
+    point_value = sym_info.trade_tick_value / (sym_info.trade_tick_size / sym_info.point)
+    current_loss = max(0.0, -sum(p.profit + p.swap for p in group))
+    max_loss = acc_info.balance * (CONFIG["maxBasketRisk"] / 100)
+    remaining_loss = max_loss - current_loss
+    total_volume = sum(p.volume for p in group) + new_lot
+    if remaining_loss <= 0 or total_volume <= 0 or point_value <= 0:
+        return 0.0
+    distance_points = remaining_loss / (total_volume * point_value)
+    minimum_points = max(sym_info.trade_stops_level, 1)
+    if distance_points <= minimum_points:
+        return 0.0
+    distance = distance_points * sym_info.point
+    stop = current_price - distance if order_type == mt5.ORDER_TYPE_BUY else current_price + distance
+    return round(stop, sym_info.digits)
+
+def protect_position_with_sl(position, emergency_sl):
+    tighter_already = (
+        position.sl > 0
+        and (
+            (position.type == mt5.ORDER_TYPE_BUY and position.sl >= emergency_sl)
+            or (position.type == mt5.ORDER_TYPE_SELL and position.sl <= emergency_sl)
+        )
+    )
+    if tighter_already:
+        return True
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": position.symbol,
+        "position": position.ticket,
+        "sl": emergency_sl,
+        "tp": position.tp,
+        "magic": CONFIG["magicNumber"],
+    }
+    result = mt5.order_send(request)
+    return bool(result and result.retcode == mt5.TRADE_RETCODE_DONE)
 
 def execute_trade(symbol, action, lot, price, sl, tp, comment):
+    if lot <= 0:
+        send_telegram("⚠️ *ORDER BLOCKED*\nCalculated lot is below the broker minimum or risk budget.")
+        return False
+    sym_info = mt5.symbol_info(symbol)
+    if not sym_info:
+        return False
+    price = round(price, sym_info.digits)
+    sl = round(sl, sym_info.digits) if sl else 0.0
+    tp = round(tp, sym_info.digits) if tp else 0.0
     request = {
         "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": lot,
         "type": action, "price": price, "sl": sl, "tp": tp, "deviation": 20,
         "magic": CONFIG["magicNumber"], "comment": comment,
-        "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_time": mt5.ORDER_TIME_GTC, "type_filling": sym_info.filling_mode,
     }
-    max_retries = 3
-    error_msg = "Unknown Error"
-    for attempt in range(max_retries):
-        res = mt5.order_send(request)
-        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            action_str = "BUY" if action == mt5.ORDER_TYPE_BUY else "SELL"
-            log_trade(res.order, f"OPEN {action_str}", symbol, lot, price, comment)
-            send_telegram(f"🤖 *AUTO-TRADE EXECUTED*\nออเดอร์: {comment}\nTicket: `{res.order}`\nPrice: {request['price']}\nLot: {lot}")
-            return True
-        else:
-            error_msg = res.comment if res else 'Unknown Error'
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                tick = mt5.symbol_info_tick(symbol)
-                if tick:
-                    request["price"] = tick.ask if action == mt5.ORDER_TYPE_BUY else tick.bid
-    send_telegram(f"❌ *AUTO-TRADE FAILED*\nพยายามยิงคำสั่ง {max_retries} ครั้งแต่ล้มเหลว\nเหตุผล: {error_msg}")
+    check = mt5.order_check(request)
+    if not check or check.retcode != 0:
+        error_msg = check.comment if check else str(mt5.last_error())
+        send_telegram(f"❌ *ORDER CHECK FAILED*\nเหตุผล: {error_msg}")
+        return False
+    # A single send is intentional: blind retries can duplicate a filled order after a timeout.
+    res = mt5.order_send(request)
+    if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+        action_str = "BUY" if action == mt5.ORDER_TYPE_BUY else "SELL"
+        log_trade(res.order, f"OPEN {action_str}", symbol, lot, request["price"], comment)
+        send_telegram(f"🤖 *AUTO-TRADE EXECUTED*\nออเดอร์: {comment}\nTicket: `{res.order}`\nPrice: {request['price']}\nLot: {lot}")
+        return True
+    error_msg = res.comment if res else str(mt5.last_error())
+    send_telegram(f"❌ *AUTO-TRADE FAILED*\nระบบไม่ส่งคำสั่งซ้ำเพื่อป้องกันออเดอร์ซ้อน\nเหตุผล: {error_msg}")
     return False
 
 def move_sl_to_breakeven(ticket, open_price, tp, symbol, type):
@@ -291,7 +455,8 @@ def move_sl_to_breakeven(ticket, open_price, tp, symbol, type):
         "action": mt5.TRADE_ACTION_SLTP, "symbol": symbol, "position": ticket,
         "sl": be_price, "tp": tp, "magic": CONFIG["magicNumber"]
     }
-    if mt5.order_send(req).retcode == mt5.TRADE_RETCODE_DONE:
+    result = mt5.order_send(req)
+    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
         send_telegram(f"🛡️ *BREAK-EVEN ACTIVATED*\nออเดอร์ `{ticket}` เลื่อน SL บังหน้าทุน + ล็อคกำไร {extra_pts} จุดเรียบร้อย!")
 
 def move_trailing_stop(ticket, new_sl, tp, symbol):
@@ -329,7 +494,7 @@ def close_position(ticket, symbol, p_type, volume, profit=0.0, comment="System C
 def trade_manager(curr_atr):
     positions = mt5.positions_get(symbol=SYMBOL)
     if not positions: return
-    bot_pos = [p for p in positions if p.magic == CONFIG["magicNumber"] or p.magic == 0]
+    bot_pos = [p for p in positions if p.magic == CONFIG["magicNumber"]]
     if not bot_pos: return
 
     acc_info = mt5.account_info()
@@ -363,7 +528,10 @@ def trade_manager(curr_atr):
                 send_telegram(f"☠️ *HARD CUT LOSS ACTIVATED*\nตะกร้าฝั่ง {side_name} ติดลบเกินขีดจำกัด\nระบบตัดขาดทุนจำนวน {closed_count} ไม้ เพื่อรักษาพอร์ต\n💸 ขาดทุนรวม: {round(total_profit, 2)}")
             continue
 
-        curr_price = mt5.symbol_info_tick(SYMBOL).bid if o_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(SYMBOL).ask
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if not tick or not sym_info:
+            continue
+        curr_price = tick.bid if o_type == mt5.ORDER_TYPE_BUY else tick.ask
         
         if CONFIG.get("enableBE", True) and sym_info:
             for p in group:
@@ -399,8 +567,12 @@ def trade_manager(curr_atr):
             loss_dist = (last_p.price_open - curr_price) if o_type == mt5.ORDER_TYPE_BUY else (curr_price - last_p.price_open)
             if loss_dist >= (curr_atr * CONFIG["dcaStepATR"]):
                 new_lot = calculate_safe_dca_lot(SYMBOL, group, curr_atr)
-                if new_lot > 0: execute_trade(SYMBOL, o_type, new_lot, curr_price, 0.0, 0.0, f"DCA Step {len(group)}")
-                else: send_telegram(f"⚠️ *DCA BLOCKED*\nระบบปฏิเสธการเปิดไม้แก้เกม เนื่องจากความเสี่ยงตะกร้าเกิน {CONFIG.get('maxBasketRisk', 5.0)}% แล้ว")
+                emergency_sl = calculate_basket_emergency_sl(SYMBOL, group, new_lot, curr_price, o_type) if new_lot > 0 else 0.0
+                protected = emergency_sl > 0 and all(protect_position_with_sl(p, emergency_sl) for p in group)
+                if protected:
+                    execute_trade(SYMBOL, o_type, new_lot, curr_price, emergency_sl, 0.0, f"DCA Step {len(group)}")
+                else:
+                    send_telegram(f"⚠️ *DCA BLOCKED*\nไม่สามารถยืนยัน Emergency SL ภายในความเสี่ยงตะกร้า {CONFIG.get('maxBasketRisk', 5.0)}% ได้")
 
 def analyze_data():
     if not mt5.initialize(): return None
@@ -457,7 +629,9 @@ def analyze_data():
     bot_state.update({
         "latest_price": df.iloc[-1]['close'], "signal": final_signal, 
         "last_update": df.iloc[-1]['time'].strftime("%Y-%m-%d %H:%M:%S"),
-        "tp": tp_price, "sl": sl_price, "lot": lot_size,
+        "tp": tp_price, "sl": sl_price,
+        "sl_distance": abs(curr['close'] - sl_price) if final_signal != "WAIT" else 0.0,
+        "lot": lot_size,
         "indicators": {
             "EMA 50": round(curr['emaFast'], 2), "EMA 100": round(curr['emaSlow'], 2),
             "EMA 8": round(curr['emaEntry'], 2), "ADX": round(curr['adx'], 2), "ATR": round(curr['atr'], 4),
@@ -471,10 +645,22 @@ def analyze_data():
         bot_state["indicators"]["🛑 Stop Loss (SL)"] = round(sl_price, 4)
         bot_state["indicators"]["📦 Rec. Lot Size"] = lot_size
 
-    if bot_state["auto_trade"]:
-        trade_manager(curr['atr'])
-
     return final_signal
+
+def get_bot_positions():
+    positions = mt5.positions_get(symbol=SYMBOL) or []
+    return [p for p in positions if p.magic == CONFIG["magicNumber"]]
+
+def get_bot_daily_pl():
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    deals = mt5.history_deals_get(midnight, datetime.now() + timedelta(days=1)) or []
+    realized = sum(
+        d.profit + d.commission + d.swap + d.fee
+        for d in deals
+        if d.type in (0, 1) and d.magic == CONFIG["magicNumber"]
+    )
+    floating = sum(p.profit + p.swap for p in get_bot_positions())
+    return realized, floating
 
 async def drawdown_monitor():
     while True:
@@ -482,23 +668,20 @@ async def drawdown_monitor():
         if bot_state["is_running"] and dd_limit > 0:
             acc_info = mt5.account_info()
             if acc_info:
-                midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-                deals = mt5.history_deals_get(midnight, datetime.now() + timedelta(days=1))
-                daily_pl = sum(d.profit for d in deals if d.type in (0, 1)) if deals else 0.0
-                
-                positions = mt5.positions_get(symbol=SYMBOL)
-                floating_pl = sum(p.profit + p.swap for p in positions) if positions else 0.0
-                
+                daily_pl, floating_pl = get_bot_daily_pl()
                 total_daily_loss = daily_pl + floating_pl
-                max_loss_limit = acc_info.balance * (dd_limit / 100)
+                day_start_balance = max(acc_info.balance - daily_pl, 0.0)
+                max_loss_limit = day_start_balance * (dd_limit / 100)
                 
                 if total_daily_loss < 0 and abs(total_daily_loss) >= max_loss_limit:
                     bot_state["is_running"] = False
+                    bot_state["auto_trade"] = False
+                    bot_state["daily_lockout_date"] = datetime.now().date().isoformat()
+                    save_runtime_state()
                     closed_count = 0
-                    if positions:
-                        for p in positions:
-                            if close_position(p.ticket, p.symbol, p.type, p.volume, p.profit + p.swap, "Max Daily Drawdown Close"): 
-                                closed_count += 1
+                    for p in get_bot_positions():
+                        if close_position(p.ticket, p.symbol, p.type, p.volume, p.profit + p.swap, "Max Daily Drawdown Close"):
+                            closed_count += 1
                     msg = (f"🛑 *MAX DAILY DRAWDOWN REACHED*\nพอร์ตขาดทุนรายวันเกินขีดจำกัด {dd_limit}%\n"
                            f"📉 ขาดทุนรวมวันนี้: {round(total_daily_loss, 2)}\n"
                            f"🛡️ ระบบปิดออเดอร์ {closed_count} ไม้ และ **STOP BOT** อัตโนมัติ!")
@@ -506,9 +689,12 @@ async def drawdown_monitor():
         await asyncio.sleep(5)
 
 async def bot_loop():
+    global last_signal_candle
     while bot_state["is_running"]:
         signal = analyze_data()
         is_news_blocked = check_news_impact()
+        if bot_state["auto_trade"] and bot_state["indicators"].get("ATR"):
+            trade_manager(bot_state["indicators"]["ATR"])
         
         if signal in ["BUY", "SELL"]:
             if is_news_blocked:
@@ -516,6 +702,11 @@ async def bot_loop():
                 await asyncio.sleep(60)
                 continue
                 
+            signal_candle = bot_state["last_update"]
+            if signal_candle == last_signal_candle:
+                await asyncio.sleep(2)
+                continue
+            last_signal_candle = signal_candle
             msg = (f"🚨 *{SYMBOL} SIGNAL: {signal}* 🚨\n\n"
                    f"💰 *Entry Price:* {bot_state['latest_price']}\n"
                    f"📦 *Lot Size:* {bot_state['lot']} (Risk {CONFIG['riskPercent']}%)\n"
@@ -530,8 +721,15 @@ async def bot_loop():
                 bot_positions = [p for p in positions if p.magic == CONFIG["magicNumber"]] if positions else []
                 if len(bot_positions) == 0:
                     action = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
-                    curr_price = mt5.symbol_info_tick(SYMBOL).ask if signal == "BUY" else mt5.symbol_info_tick(SYMBOL).bid
-                    execute_trade(SYMBOL, action, bot_state["lot"], curr_price, bot_state["sl"], bot_state["tp"], "Master7 First Entry")
+                    tick = mt5.symbol_info_tick(SYMBOL)
+                    if not tick:
+                        await asyncio.sleep(2)
+                        continue
+                    curr_price = tick.ask if signal == "BUY" else tick.bid
+                    sl_distance = bot_state["sl_distance"]
+                    sl_price = curr_price - sl_distance if signal == "BUY" else curr_price + sl_distance
+                    tp_price = curr_price + sl_distance * CONFIG["rrRatio"] if signal == "BUY" else curr_price - sl_distance * CONFIG["rrRatio"]
+                    execute_trade(SYMBOL, action, bot_state["lot"], curr_price, sl_price, tp_price, "Master7 First Entry")
                 else:
                     send_telegram("⚠️ *SIGNAL IGNORED*\nบอทยังมีออเดอร์ค้างอยู่ ข้ามการเปิดไม้ใหม่")
             await asyncio.sleep(60)
@@ -648,31 +846,55 @@ async def shutdown_event():
 @app.get("/")
 def read_root(request: Request): return templates.TemplateResponse(request=request, name="index.html", context={"state": bot_state})
 
+@app.get("/health")
+def health():
+    terminal = mt5.terminal_info()
+    return {"status": "ok", "mt5_connected": bool(terminal and terminal.connected)}
+
 @app.get("/api/config")
 def get_config(): return CONFIG
 
 @app.post("/api/config")
 def update_config(new_config: ConfigModel):
     global CONFIG
-    CONFIG.update(new_config.dict())
+    CONFIG.update(new_config.model_dump())
     save_config()
     send_telegram("⚙️ *SYSTEM CONFIG UPDATED*\nผู้ใช้งานได้เปลี่ยนการตั้งค่าบอทผ่าน Web Dashboard")
     return {"status": "success", "message": "Configuration updated successfully."}
 
-@app.get("/api/start")
-async def start_bot(background_tasks: BackgroundTasks):
-    if not bot_state["is_running"]: bot_state["is_running"] = True; background_tasks.add_task(bot_loop)
+@app.post("/api/start")
+async def start_bot():
+    global bot_task
+    today = datetime.now().date().isoformat()
+    if bot_state.get("daily_lockout_date") == today:
+        return JSONResponse(status_code=423, content={"status": "locked", "message": "Daily drawdown lockout is active until tomorrow."})
+    if bot_state.get("daily_lockout_date") != today:
+        bot_state["daily_lockout_date"] = None
+        save_runtime_state()
+    if not bot_state["is_running"]:
+        bot_state["is_running"] = True
+        bot_task = asyncio.create_task(bot_loop())
     return {"status": "started"}
 
-@app.get("/api/stop")
-def stop_bot(): bot_state["is_running"] = False; return {"status": "stopped"}
+@app.post("/api/stop")
+def stop_bot():
+    bot_state["is_running"] = False
+    bot_state["auto_trade"] = False
+    return {"status": "stopped", "auto_trade": False}
 
-@app.get("/api/toggle_auto")
-def toggle_auto(): bot_state["auto_trade"] = not bot_state["auto_trade"]; return {"auto_trade": bot_state["auto_trade"]}
+@app.post("/api/toggle_auto")
+def toggle_auto():
+    today = datetime.now().date().isoformat()
+    if bot_state.get("daily_lockout_date") == today:
+        return JSONResponse(status_code=423, content={"status": "locked", "auto_trade": False})
+    if not bot_state["is_running"]:
+        return JSONResponse(status_code=409, content={"status": "stopped", "auto_trade": False})
+    bot_state["auto_trade"] = not bot_state["auto_trade"]
+    return {"auto_trade": bot_state["auto_trade"]}
 
-@app.get("/api/close_all")
+@app.post("/api/close_all")
 def close_all_orders():
-    positions = mt5.positions_get(symbol=SYMBOL)
+    positions = get_bot_positions()
     if not positions: return {"status": "no_orders"}
     closed_count = 0
     for p in positions:

@@ -81,8 +81,12 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 MT5_SYMBOL=XAUUSD
 TIMEFRAME=M1
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=use-a-long-random-password-here
 
 ```
+
+> ระบบจะปฏิเสธการเปิด Dashboard หากไม่ได้กำหนด `DASHBOARD_PASSWORD` เพื่อป้องกันบุคคลภายนอกควบคุมบัญชี MT5
 
 
 3. **รันเซิร์ฟเวอร์ด้วย PM2 (Background Process):**
@@ -92,9 +96,6 @@ TIMEFRAME=M1
 ```caddyfile
 master.e29ckg.org {
     reverse_proxy 127.0.0.1:8000
-    tls {
-        on_demand
-    }
 }
 
 ```

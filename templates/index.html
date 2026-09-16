@@ -318,20 +318,39 @@
     <script>
         let isBotRunning = false;
 
+        function confirmedPost(path, options = {}) {
+            return fetch(path, {
+                ...options,
+                method: 'POST',
+                headers: {
+                    ...(options.headers || {}),
+                    'X-Bot-Action': 'confirm'
+                }
+            });
+        }
+
         async function toggleAction(action) {
-            await fetch(`/api/${action}`);
+            const response = await confirmedPost(`/api/${action}`);
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                alert(data.message || data.detail || 'ไม่สามารถเปลี่ยนสถานะได้');
+            }
             fetchStatus();
         }
 
         async function togglePower() {
             const action = isBotRunning ? 'stop' : 'start';
-            await fetch(`/api/${action}`);
+            const response = await confirmedPost(`/api/${action}`);
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                alert(data.message || data.detail || 'ไม่สามารถเปลี่ยนสถานะได้');
+            }
             fetchStatus();
         }
 
         async function closeAllOrders() {
             if(confirm("⚠️ คุณแน่ใจหรือไม่ที่จะปิดออเดอร์ทั้งหมดในพอร์ตตอนนี้?")) {
-                const res = await fetch('/api/close_all');
+                const res = await confirmedPost('/api/close_all');
                 const data = await res.json();
                 if(data.status === "success") { alert(`✅ ปิดออเดอร์สำเร็จจำนวน ${data.closed} ไม้`); } 
                 else { alert(`ℹ️ ไม่มีออเดอร์ค้างอยู่ในพอร์ตครับ`); }
@@ -472,12 +491,12 @@
                 newsBeforeMin: parseInt(document.getElementById('c_newsBeforeMin').value),
                 newsAfterMin: parseInt(document.getElementById('c_newsAfterMin').value)
             };
-            const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            const res = await confirmedPost('/api/config', { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
             const data = await res.json();
-            if(data.status === "success") {
+            if(res.ok && data.status === "success") {
                 alert('✅ บันทึกการตั้งค่าสำเร็จ! (บอทจะเริ่มใช้ค่าใหม่ในลูปถัดไปทันที)');
                 closeSettingsModal();
-            } else { alert('❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล'); }
+            } else { alert(`❌ ${data.detail || 'เกิดข้อผิดพลาดในการบันทึกข้อมูล'}`); }
         }
 
         function formatNum(num) { return Number(num).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
