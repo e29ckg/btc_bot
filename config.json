@@ -6,9 +6,9 @@
     "adxThresh": 25.0,
     "minWickPct": 5.0,
     "atrLen": 14,
-    "atrMultiplier": 1.5,
+    "atrMultiplier": 2.0,
     "rrRatio": 2.0,
-    "riskPercent": 1.0,
+    "riskPercent": 0.25,
     "magicNumber": 777777,
     "enableBE": true,
     "beTriggerATR": 2.0,
@@ -23,7 +23,7 @@
     "dcaTargetProfit": 3.0,
     "maxBasketRisk": 5.0,
     "hardCutRisk": 6.0,
-    "maxDailyDrawdownRisk": 6.0,
+    "maxDailyDrawdownRisk": 2.0,
     "enableNewsFilter": true,
     "newsBeforeMin": 30,
     "newsAfterMin": 30,
@@ -31,8 +31,15 @@
         "USD"
     ],
     "enableMTFFilter": true,
-    "maxSpreadPoints": 50.0,
+    "maxSpreadPoints": 400.0,
     "enableSessionFilter": false,
     "sessionStartHour": 13,
-    "sessionEndHour": 23
+    "sessionEndHour": 23,
+    "strategyMode": "donchian",
+    "donchianEntryLen": 20,
+    "donchianExitLen": 10,
+    "trendEmaLen": 200,
+    "atrRegimeLookback": 100,
+    "atrRegimeMin": 0.75,
+    "atrRegimeMax": 2.0
 }

@@ -24,6 +24,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSD")
 TIMEFRAME_STR = os.getenv("TIMEFRAME", "M1")
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "paper").lower()
 DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
 
@@ -105,6 +106,13 @@ class ConfigModel(BaseModel):
     enableSessionFilter: bool
     sessionStartHour: int = Field(ge=0, le=23)
     sessionEndHour: int = Field(ge=0, le=23)
+    strategyMode: str = Field(default="donchian", pattern="^(legacy|donchian)$")
+    donchianEntryLen: int = Field(default=20, ge=5, le=200)
+    donchianExitLen: int = Field(default=10, ge=2, le=100)
+    trendEmaLen: int = Field(default=200, ge=20, le=500)
+    atrRegimeLookback: int = Field(default=100, ge=20, le=500)
+    atrRegimeMin: float = Field(default=0.75, gt=0, le=2)
+    atrRegimeMax: float = Field(default=2.0, gt=0, le=5)
 
     @model_validator(mode="after")
     def validate_risk_relationships(self):
@@ -114,6 +122,10 @@ class ConfigModel(BaseModel):
             raise ValueError("maxBasketRisk must not exceed hardCutRisk")
         if self.enableSessionFilter and self.sessionStartHour == self.sessionEndHour:
             raise ValueError("session window cannot be zero hours")
+        if self.donchianExitLen >= self.donchianEntryLen:
+            raise ValueError("donchianExitLen must be less than donchianEntryLen")
+        if self.atrRegimeMin >= self.atrRegimeMax:
+            raise ValueError("atrRegimeMin must be less than atrRegimeMax")
         return self
 
 @asynccontextmanager
@@ -127,7 +139,7 @@ async def lifespan(app: FastAPI):
         if positions:
             known_tickets = {pos.ticket for pos in positions}
 
-    fetch_economic_calendar()
+    await asyncio.to_thread(fetch_economic_calendar)
     service_tasks = [
         asyncio.create_task(news_fetch_loop()),
         asyncio.create_task(monitor_orders()),
@@ -135,7 +147,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(drawdown_monitor()),
         asyncio.create_task(mt5_connection_monitor()),
     ]
-    send_telegram("🚀 *MASTER 7 Bot Started & Ready*")
+    await asyncio.to_thread(send_telegram, "🚀 *MASTER 7 Bot Started & Ready*")
 
     try:
         yield
@@ -182,8 +194,8 @@ async def dashboard_security(request: Request, call_next):
             status_code=401,
             headers={"WWW-Authenticate": 'Basic realm="MASTER 7 Bot"'},
         )
-    if request.url.path in MUTATING_PATHS:
-        if request.method != "POST" or request.headers.get("X-Bot-Action") != "confirm":
+    if request.method == "POST" and request.url.path in MUTATING_PATHS:
+        if request.headers.get("X-Bot-Action") != "confirm":
             return JSONResponse(status_code=405, content={"detail": "Confirmed POST request required."})
     return await call_next(request)
 
@@ -263,16 +275,16 @@ async def mt5_connection_monitor():
         terminal = mt5.terminal_info()
         if terminal is None or not terminal.connected:
             if is_connected:
-                send_telegram("⚠️ *MT5 DISCONNECTED*\nขาดการเชื่อมต่อกับเซิร์ฟเวอร์โบรกเกอร์! ระบบกำลังพยายามเชื่อมต่อใหม่...")
+                await asyncio.to_thread(send_telegram, "⚠️ *MT5 DISCONNECTED*\nขาดการเชื่อมต่อกับเซิร์ฟเวอร์โบรกเกอร์! ระบบกำลังพยายามเชื่อมต่อใหม่...")
                 is_connected = False
             if mt5.initialize():
                 terminal_retry = mt5.terminal_info()
                 if terminal_retry and terminal_retry.connected:
-                    send_telegram("✅ *MT5 RECONNECTED*\nระบบสามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้สำเร็จและพร้อมทำงานต่อแล้ว!")
+                    await asyncio.to_thread(send_telegram, "✅ *MT5 RECONNECTED*\nระบบสามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้สำเร็จและพร้อมทำงานต่อแล้ว!")
                     is_connected = True
         else:
             if not is_connected:
-                send_telegram("✅ *MT5 RECONNECTED*\nการเชื่อมต่อกลับมาเป็นปกติแล้ว!")
+                await asyncio.to_thread(send_telegram, "✅ *MT5 RECONNECTED*\nการเชื่อมต่อกลับมาเป็นปกติแล้ว!")
                 is_connected = True
         await asyncio.sleep(10)
 
@@ -327,12 +339,36 @@ def check_news_impact():
 
 async def news_fetch_loop():
     while True:
-        fetch_economic_calendar()
+        await asyncio.to_thread(fetch_economic_calendar)
         await asyncio.sleep(3600)
 
 def get_mt5_timeframe(tf_str):
     mapping = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1}
     return mapping.get(tf_str, mt5.TIMEFRAME_M15)
+
+def required_rate_count():
+    """Return enough closed candles for every configured indicator."""
+    longest_window = max(
+        CONFIG["emaFastLen"],
+        CONFIG["emaSlowLen"],
+        CONFIG["emaEntryLen"],
+        CONFIG["adxLen"] * 2,
+        CONFIG["atrLen"],
+        CONFIG.get("donchianEntryLen", 20),
+        CONFIG.get("atrRegimeLookback", 100),
+    )
+    return longest_window + 10
+
+def get_order_filling_mode(sym_info):
+    """Translate SYMBOL_FILLING_MODE flags to an ORDER_FILLING_* value."""
+    filling_flags = getattr(sym_info, "filling_mode", 0)
+    # SYMBOL_FILLING_FOK and SYMBOL_FILLING_IOC are bit flags (1 and 2),
+    # while ORDER_FILLING_FOK and ORDER_FILLING_IOC are enum values (0 and 1).
+    if filling_flags & 2:
+        return mt5.ORDER_FILLING_IOC
+    if filling_flags & 1:
+        return mt5.ORDER_FILLING_FOK
+    return mt5.ORDER_FILLING_RETURN
 
 def check_market_filters(proposed_signal: str):
     tick = mt5.symbol_info_tick(SYMBOL)
@@ -352,14 +388,22 @@ def check_market_filters(proposed_signal: str):
             return False, f"Outside Session Window ({start_h}:00 - {end_h}:00)"
 
     if CONFIG.get("enableMTFFilter", True) and proposed_signal in ["BUY", "SELL"]:
-        h1_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, 120)
-        if h1_rates is None or len(h1_rates) < max(CONFIG['emaFastLen'], CONFIG['emaSlowLen']):
+        h1_window = CONFIG.get("trendEmaLen", 200) if CONFIG.get("strategyMode") == "donchian" else max(CONFIG['emaFastLen'], CONFIG['emaSlowLen'])
+        h1_count = h1_window + 10
+        h1_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, h1_count)
+        if h1_rates is None or len(h1_rates) < h1_count:
             return False, "H1 market data unavailable"
         df_h1 = pd.DataFrame(h1_rates)
-        ema50_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaFastLen']).iloc[-2]
-        ema100_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaSlowLen']).iloc[-2]
-        if proposed_signal == "BUY" and ema50_h1 <= ema100_h1: return False, "H1 Trend is Bearish"
-        elif proposed_signal == "SELL" and ema50_h1 >= ema100_h1: return False, "H1 Trend is Bullish"
+        if CONFIG.get("strategyMode") == "donchian":
+            h1_ema = ta.trend.ema_indicator(df_h1['close'], window=h1_window).iloc[-2]
+            h1_close = df_h1['close'].iloc[-2]
+            if proposed_signal == "BUY" and h1_close <= h1_ema: return False, "H1 price is below EMA trend filter"
+            if proposed_signal == "SELL" and h1_close >= h1_ema: return False, "H1 price is above EMA trend filter"
+        else:
+            ema50_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaFastLen']).iloc[-2]
+            ema100_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaSlowLen']).iloc[-2]
+            if proposed_signal == "BUY" and ema50_h1 <= ema100_h1: return False, "H1 Trend is Bearish"
+            elif proposed_signal == "SELL" and ema50_h1 >= ema100_h1: return False, "H1 Trend is Bullish"
 
     return True, "Passed All Filters"
 
@@ -448,6 +492,9 @@ def protect_position_with_sl(position, emergency_sl):
     return bool(result and result.retcode == mt5.TRADE_RETCODE_DONE)
 
 def execute_trade(symbol, action, lot, price, sl, tp, comment):
+    if EXECUTION_MODE != "live":
+        send_telegram(f"🧪 *PAPER SIGNAL*\n{comment}\nPrice: {price}\nLot: {lot}\nSL: {sl}\nTP: {tp}")
+        return True
     if lot <= 0:
         send_telegram("⚠️ *ORDER BLOCKED*\nCalculated lot is below the broker minimum or risk budget.")
         return False
@@ -461,7 +508,7 @@ def execute_trade(symbol, action, lot, price, sl, tp, comment):
         "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": lot,
         "type": action, "price": price, "sl": sl, "tp": tp, "deviation": 20,
         "magic": CONFIG["magicNumber"], "comment": comment,
-        "type_time": mt5.ORDER_TIME_GTC, "type_filling": sym_info.filling_mode,
+        "type_time": mt5.ORDER_TIME_GTC, "type_filling": get_order_filling_mode(sym_info),
     }
     check = mt5.order_check(request)
     if not check or check.retcode != 0:
@@ -508,7 +555,8 @@ def close_position(ticket, symbol, p_type, volume, profit=0.0, comment="System C
     max_retries = 3
     for attempt in range(max_retries):
         tick = mt5.symbol_info_tick(symbol)
-        if not tick: 
+        sym_info = mt5.symbol_info(symbol)
+        if not tick or not sym_info:
             time.sleep(1)
             continue
         action_type = mt5.ORDER_TYPE_SELL if p_type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
@@ -517,7 +565,7 @@ def close_position(ticket, symbol, p_type, volume, profit=0.0, comment="System C
             "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": volume,
             "type": action_type, "position": ticket, "price": price, "deviation": 20,
             "magic": CONFIG["magicNumber"], "comment": "Close Order",
-            "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_time": mt5.ORDER_TIME_GTC, "type_filling": get_order_filling_mode(sym_info),
         }
         res = mt5.order_send(req)
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
@@ -538,9 +586,34 @@ def trade_manager(curr_atr):
     is_news_blocked = check_news_impact()
     sym_info = mt5.symbol_info(SYMBOL)
 
+    donchian_exit = None
+    if CONFIG.get("strategyMode") == "donchian":
+        exit_len = CONFIG.get("donchianExitLen", 10)
+        exit_rates = mt5.copy_rates_from_pos(SYMBOL, get_mt5_timeframe(TIMEFRAME_STR), 0, exit_len + 2)
+        if exit_rates is not None and len(exit_rates) >= exit_len + 2:
+            exit_df = pd.DataFrame(exit_rates)
+            closed_bar = exit_df.iloc[-2]
+            prior_bars = exit_df.iloc[-(exit_len + 2):-2]
+            donchian_exit = {
+                "close": closed_bar["close"],
+                "low": prior_bars["low"].min(),
+                "high": prior_bars["high"].max(),
+            }
+
     for o_type in [mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_SELL]:
         group = [p for p in bot_pos if p.type == o_type]
         if not group: continue
+
+        if donchian_exit:
+            channel_broken = (
+                o_type == mt5.ORDER_TYPE_BUY and donchian_exit["close"] < donchian_exit["low"]
+            ) or (
+                o_type == mt5.ORDER_TYPE_SELL and donchian_exit["close"] > donchian_exit["high"]
+            )
+            if channel_broken:
+                for p in group:
+                    close_position(p.ticket, p.symbol, p.type, p.volume, p.profit + p.swap, "Donchian Exit")
+                continue
         
         total_profit = sum(p.profit + p.swap for p in group)
         hard_cut_amount = balance * (CONFIG.get("hardCutRisk", 6.0) / 100)
@@ -612,8 +685,9 @@ def trade_manager(curr_atr):
 
 def analyze_data():
     if not mt5.initialize(): return None
-    rates = mt5.copy_rates_from_pos(SYMBOL, get_mt5_timeframe(TIMEFRAME_STR), 0, 150)
-    if rates is None or len(rates) == 0: return None
+    rate_count = required_rate_count()
+    rates = mt5.copy_rates_from_pos(SYMBOL, get_mt5_timeframe(TIMEFRAME_STR), 0, rate_count)
+    if rates is None or len(rates) < rate_count: return None
 
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
@@ -623,6 +697,11 @@ def analyze_data():
     df['emaEntry'] = ta.trend.ema_indicator(df['close'], window=CONFIG['emaEntryLen'])
     df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=CONFIG['adxLen']).adx()
     df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=CONFIG['atrLen']).average_true_range()
+    entry_len = CONFIG.get("donchianEntryLen", 20)
+    regime_len = CONFIG.get("atrRegimeLookback", 100)
+    df['donchianHigh'] = df['high'].rolling(entry_len).max().shift(1)
+    df['donchianLow'] = df['low'].rolling(entry_len).min().shift(1)
+    df['atrMedian'] = df['atr'].rolling(regime_len).median()
 
     df['candleRange'] = df['high'] - df['low']
     df['upperWick'] = df['high'] - df[['open', 'close']].max(axis=1)
@@ -633,6 +712,13 @@ def analyze_data():
     curr = df.iloc[-2]
     prev = df.iloc[-3]
 
+    required_values = [
+        curr['emaFast'], curr['emaSlow'], curr['emaEntry'], curr['adx'], curr['atr'],
+        prev['emaEntry'], curr['lowerWickPct'], curr['upperWickPct'],
+    ]
+    if not all(math.isfinite(float(value)) for value in required_values):
+        return None
+
     # 🔒 บังคับผลลัพธ์ให้เป็น True/False แบบ 100% (Bulletproof)
     isUptrend = bool(curr['emaFast'] > curr['emaSlow'])
     isDowntrend = bool(curr['emaFast'] < curr['emaSlow'])
@@ -641,8 +727,14 @@ def analyze_data():
     buyTrigger = bool((curr['close'] > curr['emaEntry']) and (prev['close'] <= prev['emaEntry']))
     sellTrigger = bool((curr['close'] < curr['emaEntry']) and (prev['close'] >= prev['emaEntry']))
 
-    buySignal = bool(isUptrend and isTrending and buyTrigger and (curr['lowerWickPct'] >= CONFIG.get('minWickPct', 5.0)))
-    sellSignal = bool(isDowntrend and isTrending and sellTrigger and (curr['upperWickPct'] >= CONFIG.get('minWickPct', 5.0)))
+    if CONFIG.get("strategyMode") == "donchian":
+        atr_ratio = curr['atr'] / curr['atrMedian'] if curr['atrMedian'] > 0 else 0.0
+        regime_ok = CONFIG.get("atrRegimeMin", 0.75) <= atr_ratio <= CONFIG.get("atrRegimeMax", 2.0)
+        buySignal = bool(regime_ok and curr['close'] > curr['donchianHigh'])
+        sellSignal = bool(regime_ok and curr['close'] < curr['donchianLow'])
+    else:
+        buySignal = bool(isUptrend and isTrending and buyTrigger and (curr['lowerWickPct'] >= CONFIG.get('minWickPct', 5.0)))
+        sellSignal = bool(isDowntrend and isTrending and sellTrigger and (curr['upperWickPct'] >= CONFIG.get('minWickPct', 5.0)))
 
     raw_signal = "BUY" if buySignal else "SELL" if sellSignal else "WAIT"
     is_filter_passed, filter_reason = check_market_filters(raw_signal)
@@ -660,6 +752,8 @@ def analyze_data():
                 sl_price, tp_price = curr['close'] - sl_dist, curr['close'] + (sl_dist * CONFIG['rrRatio'])
             elif final_signal == "SELL":
                 sl_price, tp_price = curr['close'] + sl_dist, curr['close'] - (sl_dist * CONFIG['rrRatio'])
+            if CONFIG.get("strategyMode") == "donchian":
+                tp_price = 0.0
             lot_size = calculate_lot_size(SYMBOL, sl_points, CONFIG['riskPercent'])
 
     bot_state.update({
@@ -700,44 +794,48 @@ def get_bot_daily_pl():
 
 async def drawdown_monitor():
     while True:
-        dd_limit = CONFIG.get("maxDailyDrawdownRisk", 0.0)
-        if bot_state["is_running"] and dd_limit > 0:
-            acc_info = mt5.account_info()
-            if acc_info:
-                daily_pl, floating_pl = get_bot_daily_pl()
-                total_daily_loss = daily_pl + floating_pl
-                day_start_balance = max(acc_info.balance - daily_pl, 0.0)
-                max_loss_limit = day_start_balance * (dd_limit / 100)
-                
-                if total_daily_loss < 0 and abs(total_daily_loss) >= max_loss_limit:
-                    bot_state["is_running"] = False
-                    bot_state["auto_trade"] = False
-                    bot_state["daily_lockout_date"] = datetime.now().date().isoformat()
-                    save_runtime_state()
-                    closed_count = 0
-                    for p in get_bot_positions():
-                        if close_position(p.ticket, p.symbol, p.type, p.volume, p.profit + p.swap, "Max Daily Drawdown Close"):
-                            closed_count += 1
-                    msg = (f"🛑 *MAX DAILY DRAWDOWN REACHED*\nพอร์ตขาดทุนรายวันเกินขีดจำกัด {dd_limit}%\n"
-                           f"📉 ขาดทุนรวมวันนี้: {round(total_daily_loss, 2)}\n"
-                           f"🛡️ ระบบปิดออเดอร์ {closed_count} ไม้ และ **STOP BOT** อัตโนมัติ!")
-                    send_telegram(msg)
+        await asyncio.to_thread(check_daily_drawdown)
         await asyncio.sleep(5)
+
+def check_daily_drawdown():
+    """Run one blocking MT5 drawdown check outside the asyncio event loop."""
+    dd_limit = CONFIG.get("maxDailyDrawdownRisk", 0.0)
+    if bot_state["is_running"] and dd_limit > 0:
+        acc_info = mt5.account_info()
+        if acc_info:
+            daily_pl, floating_pl = get_bot_daily_pl()
+            total_daily_loss = daily_pl + floating_pl
+            day_start_balance = max(acc_info.balance - daily_pl, 0.0)
+            max_loss_limit = day_start_balance * (dd_limit / 100)
+
+            if max_loss_limit > 0 and total_daily_loss < 0 and abs(total_daily_loss) >= max_loss_limit:
+                bot_state["is_running"] = False
+                bot_state["auto_trade"] = False
+                bot_state["daily_lockout_date"] = datetime.now().date().isoformat()
+                save_runtime_state()
+                closed_count = 0
+                for p in get_bot_positions():
+                    if close_position(p.ticket, p.symbol, p.type, p.volume, p.profit + p.swap, "Max Daily Drawdown Close"):
+                        closed_count += 1
+                msg = (f"🛑 *MAX DAILY DRAWDOWN REACHED*\nพอร์ตขาดทุนรายวันเกินขีดจำกัด {dd_limit}%\n"
+                       f"📉 ขาดทุนรวมวันนี้: {round(total_daily_loss, 2)}\n"
+                       f"🛡️ ระบบปิดออเดอร์ {closed_count} ไม้ และ **STOP BOT** อัตโนมัติ!")
+                send_telegram(msg)
 
 async def bot_loop():
     global last_signal_candle
     while bot_state["is_running"]:
-        signal = analyze_data()
-        is_news_blocked = check_news_impact()
+        signal = await asyncio.to_thread(analyze_data)
+        is_news_blocked = await asyncio.to_thread(check_news_impact)
         if bot_state["auto_trade"] and bot_state["indicators"].get("ATR"):
-            trade_manager(bot_state["indicators"]["ATR"])
-        
+            await asyncio.to_thread(trade_manager, bot_state["indicators"]["ATR"])
+
         if signal in ["BUY", "SELL"]:
             if is_news_blocked:
-                send_telegram(f"📰 *SIGNAL PAUSED (HIGH-IMPACT NEWS)*\nมีสัญญาณ {signal} แต่ระบบงดเข้าออเดอร์เนื่องจากติดข่าว:\n_{bot_state['news_status']['reason']}_")
+                await asyncio.to_thread(send_telegram, f"📰 *SIGNAL PAUSED (HIGH-IMPACT NEWS)*\nมีสัญญาณ {signal} แต่ระบบงดเข้าออเดอร์เนื่องจากติดข่าว:\n_{bot_state['news_status']['reason']}_")
                 await asyncio.sleep(60)
                 continue
-                
+
             signal_candle = bot_state["last_update"]
             if signal_candle == last_signal_candle:
                 await asyncio.sleep(2)
@@ -750,24 +848,24 @@ async def bot_loop():
                    f"🛑 *Stop Loss:* {round(bot_state['sl'], 4)}\n\n"
                    f"📊 ATR: {bot_state['indicators']['ATR']} | ADX: {bot_state['indicators']['ADX']}\n"
                    f"🛡️ Filter Status: {bot_state['market_filter_status']['reason']}")
-            send_telegram(msg)
-            
+            await asyncio.to_thread(send_telegram, msg)
+
             if bot_state["auto_trade"]:
-                positions = mt5.positions_get(symbol=SYMBOL)
+                positions = await asyncio.to_thread(mt5.positions_get, symbol=SYMBOL)
                 bot_positions = [p for p in positions if p.magic == CONFIG["magicNumber"]] if positions else []
                 if len(bot_positions) == 0:
                     action = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
-                    tick = mt5.symbol_info_tick(SYMBOL)
+                    tick = await asyncio.to_thread(mt5.symbol_info_tick, SYMBOL)
                     if not tick:
                         await asyncio.sleep(2)
                         continue
                     curr_price = tick.ask if signal == "BUY" else tick.bid
                     sl_distance = bot_state["sl_distance"]
                     sl_price = curr_price - sl_distance if signal == "BUY" else curr_price + sl_distance
-                    tp_price = curr_price + sl_distance * CONFIG["rrRatio"] if signal == "BUY" else curr_price - sl_distance * CONFIG["rrRatio"]
-                    execute_trade(SYMBOL, action, bot_state["lot"], curr_price, sl_price, tp_price, "Master7 First Entry")
+                    tp_price = 0.0 if CONFIG.get("strategyMode") == "donchian" else (curr_price + sl_distance * CONFIG["rrRatio"] if signal == "BUY" else curr_price - sl_distance * CONFIG["rrRatio"])
+                    await asyncio.to_thread(execute_trade, SYMBOL, action, bot_state["lot"], curr_price, sl_price, tp_price, "Master7 First Entry")
                 else:
-                    send_telegram("⚠️ *SIGNAL IGNORED*\nบอทยังมีออเดอร์ค้างอยู่ ข้ามการเปิดไม้ใหม่")
+                    await asyncio.to_thread(send_telegram, "⚠️ *SIGNAL IGNORED*\nบอทยังมีออเดอร์ค้างอยู่ ข้ามการเปิดไม้ใหม่")
             await asyncio.sleep(60)
         else:
             await asyncio.sleep(2)
@@ -799,7 +897,7 @@ async def monitor_orders():
                 for ticket in closed_orders:
                     combined_message += f"- Ticket: `{ticket}` has been closed.\n"
             
-            send_telegram(combined_message)
+            await asyncio.to_thread(send_telegram, combined_message)
         known_tickets = current_tickets
         await asyncio.sleep(3)
 
@@ -825,7 +923,7 @@ async def hourly_status_report():
                    f"🎯 *Today's P/L:* {daily_pl:,.2f}\n"
                    f"🌊 *Floating P/L:* {floating_pl:,.2f}\n"
                    f"📦 *Active Orders:* {open_orders} ไม้\n")
-            send_telegram(msg)
+            await asyncio.to_thread(send_telegram, msg)
 
 def get_dashboard_data():
     mt5.initialize()

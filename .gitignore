@@ -8,6 +8,7 @@ env/
 #
 trade_log.csv
 runtime_state.json
+backtest*_results.json
 
 # Python cache
 __pycache__/
