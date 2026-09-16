@@ -12,6 +12,7 @@ import pandas as pd
 import ta
 import psutil
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -115,7 +116,42 @@ class ConfigModel(BaseModel):
             raise ValueError("session window cannot be zero hours")
         return self
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global known_tickets, bot_task
+
+    if not mt5.initialize():
+        print(f"MT5 initialization failed: {mt5.last_error()}")
+    else:
+        positions = mt5.positions_get()
+        if positions:
+            known_tickets = {pos.ticket for pos in positions}
+
+    fetch_economic_calendar()
+    service_tasks = [
+        asyncio.create_task(news_fetch_loop()),
+        asyncio.create_task(monitor_orders()),
+        asyncio.create_task(hourly_status_report()),
+        asyncio.create_task(drawdown_monitor()),
+        asyncio.create_task(mt5_connection_monitor()),
+    ]
+    send_telegram("🚀 *MASTER 7 Bot Started & Ready*")
+
+    try:
+        yield
+    finally:
+        bot_state["is_running"] = False
+        bot_state["auto_trade"] = False
+        if bot_task and not bot_task.done():
+            bot_task.cancel()
+            service_tasks.append(bot_task)
+        for task in service_tasks:
+            task.cancel()
+        await asyncio.gather(*service_tasks, return_exceptions=True)
+        bot_task = None
+        mt5.shutdown()
+
+app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
 
 MUTATING_PATHS = {"/api/config", "/api/start", "/api/stop", "/api/toggle_auto", "/api/close_all"}
@@ -819,29 +855,6 @@ def get_dashboard_data():
             pos_data.append({"ticket": p.ticket, "symbol": p.symbol, "type": "BUY" if p.type == 0 else "SELL", "volume": p.volume, "pips": round(diff / point if point > 0 else 0, 1), "profit": round(p.profit, 2), "bot": "Yes" if p.magic == CONFIG["magicNumber"] else "No"})
 
     return {"sys": sys_data, "acc": acc_data, "bot": bot_state, "market": market_data, "positions": pos_data}
-
-@app.on_event("startup")
-async def startup_event():
-    if not mt5.initialize():
-        print("MT5 initialization failed")
-    else:
-        positions = mt5.positions_get()
-        if positions:
-            global known_tickets
-            known_tickets = {pos.ticket for pos in positions}
-
-    fetch_economic_calendar() 
-    asyncio.create_task(news_fetch_loop()) 
-    asyncio.create_task(monitor_orders())
-    asyncio.create_task(hourly_status_report())
-    asyncio.create_task(drawdown_monitor())
-    asyncio.create_task(mt5_connection_monitor())
-    
-    send_telegram("🚀 *MASTER 7 Bot Started & Ready*")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    mt5.shutdown()
 
 @app.get("/")
 def read_root(request: Request): return templates.TemplateResponse(request=request, name="index.html", context={"state": bot_state})
