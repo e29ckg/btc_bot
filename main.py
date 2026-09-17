@@ -31,6 +31,7 @@ DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
 CONFIG_FILE = "config.json"
 TRADE_LOG_FILE = "trade_log.csv"
 RUNTIME_STATE_FILE = "runtime_state.json"
+PAPER_LOG_FILE = "paper_trade_log.csv"
 
 CONFIG = {
     "emaFastLen": 50, "emaSlowLen": 100, "emaEntryLen": 8,
@@ -44,12 +45,15 @@ CONFIG = {
     "maxBasketRisk": 5.0,
     "hardCutRisk": 6.0,
     "maxDailyDrawdownRisk": 10.0,
+    "maxWeeklyDrawdownRisk": 5.0,
+    "maxConsecutiveLosses": 5,
     "enableNewsFilter": True,
     "newsBeforeMin": 30,
     "newsAfterMin": 30,
     "newsCurrencies": ["USD"],
     "enableMTFFilter": True,
     "maxSpreadPoints": 50.0,
+    "maxSpreadRiskRatio": 0.1,
     "enableSessionFilter": False,
     "sessionStartHour": 13,
     "sessionEndHour": 23
@@ -98,11 +102,14 @@ class ConfigModel(BaseModel):
     maxBasketRisk: float = Field(gt=0, le=5)
     hardCutRisk: float = Field(gt=0, le=6)
     maxDailyDrawdownRisk: float = Field(gt=0, le=10)
+    maxWeeklyDrawdownRisk: float = Field(default=5.0, gt=0, le=20)
+    maxConsecutiveLosses: int = Field(default=5, ge=1, le=20)
     enableNewsFilter: bool
     newsBeforeMin: int = Field(ge=0, le=240)
     newsAfterMin: int = Field(ge=0, le=240)
     enableMTFFilter: bool
     maxSpreadPoints: float = Field(gt=0, le=500)
+    maxSpreadRiskRatio: float = Field(default=0.1, gt=0, le=0.5)
     enableSessionFilter: bool
     sessionStartHour: int = Field(ge=0, le=23)
     sessionEndHour: int = Field(ge=0, le=23)
@@ -206,6 +213,20 @@ bot_state = {
     "news_status": {"is_blocked": False, "reason": "No major news near", "next_news": "-"},
     "market_filter_status": {"is_filtered": False, "reason": "All conditions clear"},
     "daily_lockout_date": None,
+    "weekly_lockout_week": None,
+    "signal_candle": None,
+}
+
+paper_state = {
+    "position": None,
+    "realized_pl": 0.0,
+    "floating_pl": 0.0,
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "consecutive_losses": 0,
+    "week_start_balance": None,
+    "week_key": None,
 }
 
 known_tickets = set()
@@ -213,19 +234,32 @@ cached_news = []
 news_last_updated = None
 bot_task = None
 last_signal_candle = None
+bot_started_at = None
 
 def load_runtime_state():
+    global last_signal_candle
     try:
         with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as state_file:
             saved = json.load(state_file)
         bot_state["daily_lockout_date"] = saved.get("daily_lockout_date")
+        bot_state["weekly_lockout_week"] = saved.get("weekly_lockout_week")
+        last_signal_candle = saved.get("last_signal_candle")
+        saved_paper = saved.get("paper_state")
+        if isinstance(saved_paper, dict):
+            paper_state.update(saved_paper)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         bot_state["daily_lockout_date"] = None
+        bot_state["weekly_lockout_week"] = None
 
 def save_runtime_state():
     try:
         with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as state_file:
-            json.dump({"daily_lockout_date": bot_state.get("daily_lockout_date")}, state_file)
+            json.dump({
+                "daily_lockout_date": bot_state.get("daily_lockout_date"),
+                "weekly_lockout_week": bot_state.get("weekly_lockout_week"),
+                "last_signal_candle": last_signal_candle,
+                "paper_state": paper_state,
+            }, state_file, indent=2)
     except OSError as exc:
         print(f"Runtime state save failed: {exc}")
 
@@ -345,6 +379,9 @@ async def news_fetch_loop():
 def get_mt5_timeframe(tf_str):
     mapping = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1}
     return mapping.get(tf_str, mt5.TIMEFRAME_M15)
+
+def timeframe_seconds(tf_str):
+    return {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}.get(tf_str, 900)
 
 def required_rate_count():
     """Return enough closed candles for every configured indicator."""
@@ -491,10 +528,142 @@ def protect_position_with_sl(position, emergency_sl):
     result = mt5.order_send(request)
     return bool(result and result.retcode == mt5.TRADE_RETCODE_DONE)
 
+def log_paper_trade(action, position, price, profit=0.0, reason=""):
+    file_exists = os.path.isfile(PAPER_LOG_FILE)
+    with open(PAPER_LOG_FILE, "a", newline="", encoding="utf-8-sig") as log_file:
+        writer = csv.writer(log_file)
+        if not file_exists:
+            writer.writerow(["Timestamp", "Ticket", "Action", "Symbol", "Volume", "Price", "Reason", "EMA_Fast", "EMA_Slow", "ADX", "ATR", "Profit"])
+        writer.writerow([
+            datetime.now().isoformat(timespec="seconds"), position["ticket"], action,
+            position["symbol"], position["volume"], round(price, 5), reason,
+            bot_state["indicators"].get("EMA Fast", ""), bot_state["indicators"].get("EMA Slow", ""),
+            bot_state["indicators"].get("ADX", ""), bot_state["indicators"].get("ATR", ""), round(profit, 2),
+        ])
+
+def paper_profit(position, exit_price):
+    sym_info = mt5.symbol_info(position["symbol"])
+    if not sym_info or sym_info.trade_tick_size <= 0:
+        return 0.0
+    direction = 1 if position["type"] == "BUY" else -1
+    ticks = (exit_price - position["entry"]) * direction / sym_info.trade_tick_size
+    return ticks * sym_info.trade_tick_value * position["volume"]
+
+def close_paper_position(exit_price, reason):
+    position = paper_state.get("position")
+    if not position:
+        return False
+    profit = paper_profit(position, exit_price)
+    paper_state["realized_pl"] += profit
+    paper_state["floating_pl"] = 0.0
+    paper_state["trades"] += 1
+    if profit > 0:
+        paper_state["wins"] += 1
+        paper_state["consecutive_losses"] = 0
+    elif profit < 0:
+        paper_state["losses"] += 1
+        paper_state["consecutive_losses"] += 1
+    else:
+        paper_state["consecutive_losses"] = 0
+    log_paper_trade(f"CLOSE {position['type']}", position, exit_price, profit, reason)
+    paper_state["position"] = None
+    save_runtime_state()
+    send_telegram(f"🧪 *PAPER TRADE CLOSED*\n{position['type']} {position['symbol']}\nP/L: {profit:.2f}\nReason: {reason}")
+    return True
+
+def open_paper_trade(symbol, action, lot, price, sl, tp, comment):
+    if paper_state.get("position"):
+        return False
+    account = mt5.account_info()
+    current_equity = (account.balance if account else 0.0) + paper_state["realized_pl"]
+    if paper_state.get("week_start_balance") is None:
+        paper_state["week_start_balance"] = current_equity
+    if paper_state["consecutive_losses"] >= CONFIG.get("maxConsecutiveLosses", 5):
+        send_telegram("🧪 *PAPER ENTRY BLOCKED*\nConsecutive-loss limit reached.")
+        return False
+    position = {
+        "ticket": f"PAPER-{int(time.time())}", "symbol": symbol,
+        "type": "BUY" if action == mt5.ORDER_TYPE_BUY else "SELL",
+        "volume": float(lot), "entry": float(price), "sl": float(sl),
+        "tp": float(tp), "opened_at": datetime.now(timezone.utc).isoformat(),
+        "comment": comment,
+    }
+    paper_state["position"] = position
+    log_paper_trade(f"OPEN {position['type']}", position, price, 0.0, comment)
+    save_runtime_state()
+    send_telegram(f"🧪 *PAPER TRADE OPENED*\n{position['type']} {symbol}\nPrice: {price}\nLot: {lot}\nSL: {sl}")
+    return True
+
+def paper_trade_manager(curr_atr):
+    account = mt5.account_info()
+    base_balance = account.balance if account else 0.0
+    current_equity = base_balance + paper_state["realized_pl"] + paper_state["floating_pl"]
+    week_key = datetime.now().strftime("%G-W%V")
+    if paper_state.get("week_key") != week_key:
+        paper_state["week_key"] = week_key
+        paper_state["week_start_balance"] = current_equity
+        paper_state["consecutive_losses"] = 0
+        if bot_state.get("weekly_lockout_week") != week_key:
+            bot_state["weekly_lockout_week"] = None
+        save_runtime_state()
+    week_start = paper_state.get("week_start_balance") or current_equity
+    weekly_limit = week_start * CONFIG.get("maxWeeklyDrawdownRisk", 5.0) / 100
+    if weekly_limit > 0 and current_equity <= week_start - weekly_limit:
+        bot_state["weekly_lockout_week"] = week_key
+        bot_state["auto_trade"] = False
+        position = paper_state.get("position")
+        if position:
+            tick = mt5.symbol_info_tick(position["symbol"])
+            if tick:
+                close_paper_position(tick.bid if position["type"] == "BUY" else tick.ask, "Max Weekly Drawdown")
+        save_runtime_state()
+        return
+
+    position = paper_state.get("position")
+    if not position:
+        return
+    tick = mt5.symbol_info_tick(position["symbol"])
+    sym_info = mt5.symbol_info(position["symbol"])
+    if not tick or not sym_info:
+        return
+    current_price = tick.bid if position["type"] == "BUY" else tick.ask
+    paper_state["floating_pl"] = paper_profit(position, current_price)
+
+    if (position["type"] == "BUY" and current_price <= position["sl"]) or (
+        position["type"] == "SELL" and current_price >= position["sl"]
+    ):
+        close_paper_position(current_price, "Stop Loss")
+        return
+
+    if CONFIG.get("strategyMode") == "donchian":
+        exit_len = CONFIG.get("donchianExitLen", 10)
+        rates = mt5.copy_rates_from_pos(SYMBOL, get_mt5_timeframe(TIMEFRAME_STR), 0, exit_len + 2)
+        if rates is not None and len(rates) >= exit_len + 2:
+            exit_df = pd.DataFrame(rates)
+            closed_bar = exit_df.iloc[-2]
+            prior = exit_df.iloc[-(exit_len + 2):-2]
+            broken = (position["type"] == "BUY" and closed_bar["close"] < prior["low"].min()) or (
+                position["type"] == "SELL" and closed_bar["close"] > prior["high"].max()
+            )
+            if broken:
+                close_paper_position(current_price, "Donchian Exit")
+                return
+
+    profit_dist = current_price - position["entry"] if position["type"] == "BUY" else position["entry"] - current_price
+    old_sl = position["sl"]
+    if CONFIG.get("enableBE") and profit_dist >= curr_atr * CONFIG["beTriggerATR"]:
+        extra = CONFIG.get("beProfitPoints", 20.0) * sym_info.point
+        be_price = position["entry"] + extra if position["type"] == "BUY" else position["entry"] - extra
+        position["sl"] = max(position["sl"], be_price) if position["type"] == "BUY" else min(position["sl"], be_price)
+    if CONFIG.get("enableTrailing") and profit_dist >= curr_atr * CONFIG["trailStartATR"]:
+        trail = current_price - curr_atr * CONFIG["trailDistanceATR"] if position["type"] == "BUY" else current_price + curr_atr * CONFIG["trailDistanceATR"]
+        position["sl"] = max(position["sl"], trail) if position["type"] == "BUY" else min(position["sl"], trail)
+    if position["sl"] != old_sl:
+        save_runtime_state()
+
 def execute_trade(symbol, action, lot, price, sl, tp, comment):
     if EXECUTION_MODE != "live":
-        send_telegram(f"🧪 *PAPER SIGNAL*\n{comment}\nPrice: {price}\nLot: {lot}\nSL: {sl}\nTP: {tp}")
-        return True
+        return open_paper_trade(symbol, action, lot, price, sl, tp, comment)
     if lot <= 0:
         send_telegram("⚠️ *ORDER BLOCKED*\nCalculated lot is below the broker minimum or risk budget.")
         return False
@@ -738,6 +907,15 @@ def analyze_data():
 
     raw_signal = "BUY" if buySignal else "SELL" if sellSignal else "WAIT"
     is_filter_passed, filter_reason = check_market_filters(raw_signal)
+    if is_filter_passed and raw_signal in ["BUY", "SELL"]:
+        sym_info = mt5.symbol_info(SYMBOL)
+        tick = mt5.symbol_info_tick(SYMBOL)
+        sl_distance = curr['atr'] * CONFIG['atrMultiplier']
+        spread_price = tick.ask - tick.bid if tick else float("inf")
+        max_ratio = CONFIG.get("maxSpreadRiskRatio", 0.1)
+        if not sym_info or sl_distance <= 0 or spread_price / sl_distance > max_ratio:
+            is_filter_passed = False
+            filter_reason = f"Spread/SL ratio too high ({spread_price / sl_distance:.1%} > {max_ratio:.1%})" if sl_distance > 0 else "Invalid stop distance"
     bot_state["market_filter_status"] = {"is_filtered": not is_filter_passed, "reason": filter_reason}
 
     final_signal = raw_signal if is_filter_passed else "WAIT"
@@ -759,6 +937,7 @@ def analyze_data():
     bot_state.update({
         "latest_price": df.iloc[-1]['close'], "signal": final_signal, 
         "last_update": df.iloc[-1]['time'].strftime("%Y-%m-%d %H:%M:%S"),
+        "signal_candle": curr['time'].strftime("%Y-%m-%d %H:%M:%S"),
         "tp": tp_price, "sl": sl_price,
         "sl_distance": abs(curr['close'] - sl_price) if final_signal != "WAIT" else 0.0,
         "lot": lot_size,
@@ -792,6 +971,30 @@ def get_bot_daily_pl():
     floating = sum(p.profit + p.swap for p in get_bot_positions())
     return realized, floating
 
+def current_week_key():
+    return datetime.now().strftime("%G-W%V")
+
+def get_bot_weekly_pl():
+    now = datetime.now()
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    deals = mt5.history_deals_get(week_start, now + timedelta(days=1)) or []
+    realized = sum(d.profit + d.commission + d.swap + d.fee for d in deals
+                   if d.type in (0, 1) and d.magic == CONFIG["magicNumber"])
+    floating = sum(p.profit + p.swap for p in get_bot_positions())
+    return realized, floating
+
+def get_live_consecutive_losses():
+    now = datetime.now()
+    deals = mt5.history_deals_get(now - timedelta(days=90), now + timedelta(days=1)) or []
+    exits = [d for d in deals if d.magic == CONFIG["magicNumber"] and d.type in (0, 1)
+             and getattr(d, "entry", None) == getattr(mt5, "DEAL_ENTRY_OUT", 1)]
+    losses = 0
+    for deal in sorted(exits, key=lambda d: getattr(d, "time_msc", d.time), reverse=True):
+        if deal.profit + deal.commission + deal.swap + deal.fee >= 0:
+            break
+        losses += 1
+    return losses
+
 async def drawdown_monitor():
     while True:
         await asyncio.to_thread(check_daily_drawdown)
@@ -821,26 +1024,54 @@ def check_daily_drawdown():
                        f"📉 ขาดทุนรวมวันนี้: {round(total_daily_loss, 2)}\n"
                        f"🛡️ ระบบปิดออเดอร์ {closed_count} ไม้ และ **STOP BOT** อัตโนมัติ!")
                 send_telegram(msg)
+                return
+
+    if bot_state["is_running"] and EXECUTION_MODE == "live":
+        acc_info = mt5.account_info()
+        weekly_limit_pct = CONFIG.get("maxWeeklyDrawdownRisk", 0.0)
+        if acc_info and weekly_limit_pct > 0:
+            realized, floating = get_bot_weekly_pl()
+            week_start_balance = max(acc_info.balance - realized, 0.0)
+            if week_start_balance > 0 and realized + floating <= -(week_start_balance * weekly_limit_pct / 100):
+                bot_state["auto_trade"] = False
+                bot_state["weekly_lockout_week"] = current_week_key()
+                save_runtime_state()
+                for position in get_bot_positions():
+                    close_position(position.ticket, position.symbol, position.type, position.volume,
+                                   position.profit + position.swap, "Max Weekly Drawdown Close")
+                send_telegram(f"🛑 *MAX WEEKLY DRAWDOWN REACHED*\nระงับการเปิดออเดอร์ใหม่จนถึงสัปดาห์ถัดไป ({weekly_limit_pct}%)")
+                return
+        if get_live_consecutive_losses() >= CONFIG.get("maxConsecutiveLosses", 5):
+            bot_state["auto_trade"] = False
 
 async def bot_loop():
     global last_signal_candle
     while bot_state["is_running"]:
         signal = await asyncio.to_thread(analyze_data)
         is_news_blocked = await asyncio.to_thread(check_news_impact)
-        if bot_state["auto_trade"] and bot_state["indicators"].get("ATR"):
-            await asyncio.to_thread(trade_manager, bot_state["indicators"]["ATR"])
+        if bot_state["indicators"].get("ATR"):
+            manager = paper_trade_manager if EXECUTION_MODE != "live" else trade_manager
+            await asyncio.to_thread(manager, bot_state["indicators"]["ATR"])
 
         if signal in ["BUY", "SELL"]:
+            signal_time = datetime.strptime(bot_state["signal_candle"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            signal_close_time = signal_time + timedelta(seconds=timeframe_seconds(TIMEFRAME_STR))
+            if bot_started_at and signal_close_time <= bot_started_at:
+                last_signal_candle = bot_state["signal_candle"]
+                save_runtime_state()
+                await asyncio.sleep(2)
+                continue
             if is_news_blocked:
                 await asyncio.to_thread(send_telegram, f"📰 *SIGNAL PAUSED (HIGH-IMPACT NEWS)*\nมีสัญญาณ {signal} แต่ระบบงดเข้าออเดอร์เนื่องจากติดข่าว:\n_{bot_state['news_status']['reason']}_")
                 await asyncio.sleep(60)
                 continue
 
-            signal_candle = bot_state["last_update"]
+            signal_candle = bot_state["signal_candle"]
             if signal_candle == last_signal_candle:
                 await asyncio.sleep(2)
                 continue
             last_signal_candle = signal_candle
+            save_runtime_state()
             msg = (f"🚨 *{SYMBOL} SIGNAL: {signal}* 🚨\n\n"
                    f"💰 *Entry Price:* {bot_state['latest_price']}\n"
                    f"📦 *Lot Size:* {bot_state['lot']} (Risk {CONFIG['riskPercent']}%)\n"
@@ -936,6 +1167,11 @@ def get_dashboard_data():
         midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         deals = mt5.history_deals_get(midnight, datetime.now() + timedelta(days=1))
         if deals: acc_data["daily_pl"] = sum(d.profit for d in deals if d.type in (0, 1))
+        if EXECUTION_MODE != "live":
+            acc_data["balance"] = acc_info.balance + paper_state["realized_pl"]
+            acc_data["equity"] = acc_data["balance"] + paper_state["floating_pl"]
+            acc_data["floating_pl"] = paper_state["floating_pl"]
+            acc_data["daily_pl"] = paper_state["realized_pl"]
 
     market_data = {"symbol": SYMBOL, "bid": 0.0, "ask": 0.0, "spread": 0.0}
     tick = mt5.symbol_info_tick(SYMBOL)
@@ -952,7 +1188,17 @@ def get_dashboard_data():
             diff = p.price_current - p.price_open if p.type == 0 else p.price_open - p.price_current
             pos_data.append({"ticket": p.ticket, "symbol": p.symbol, "type": "BUY" if p.type == 0 else "SELL", "volume": p.volume, "pips": round(diff / point if point > 0 else 0, 1), "profit": round(p.profit, 2), "bot": "Yes" if p.magic == CONFIG["magicNumber"] else "No"})
 
-    return {"sys": sys_data, "acc": acc_data, "bot": bot_state, "market": market_data, "positions": pos_data}
+    if EXECUTION_MODE != "live" and paper_state.get("position"):
+        p = paper_state["position"]
+        current = tick.bid if tick and p["type"] == "BUY" else tick.ask if tick else p["entry"]
+        point = sym_info.point if sym_info and sym_info.point > 0 else 0.01
+        diff = current - p["entry"] if p["type"] == "BUY" else p["entry"] - current
+        pos_data = [{"ticket": p["ticket"], "symbol": p["symbol"], "type": p["type"], "volume": p["volume"],
+                     "pips": round(diff / point, 1), "profit": round(paper_state["floating_pl"], 2), "bot": "Paper"}]
+
+    runtime = {"execution_mode": EXECUTION_MODE.upper(), "strategy": CONFIG.get("strategyMode", "legacy").upper(),
+               "timeframe": TIMEFRAME_STR, "paper": paper_state}
+    return {"sys": sys_data, "acc": acc_data, "bot": bot_state, "market": market_data, "positions": pos_data, "runtime": runtime}
 
 @app.get("/")
 def read_root(request: Request): return templates.TemplateResponse(request=request, name="index.html", context={"state": bot_state})
@@ -975,15 +1221,24 @@ def update_config(new_config: ConfigModel):
 
 @app.post("/api/start")
 async def start_bot():
-    global bot_task
+    global bot_task, bot_started_at
     today = datetime.now().date().isoformat()
     if bot_state.get("daily_lockout_date") == today:
         return JSONResponse(status_code=423, content={"status": "locked", "message": "Daily drawdown lockout is active until tomorrow."})
     if bot_state.get("daily_lockout_date") != today:
         bot_state["daily_lockout_date"] = None
         save_runtime_state()
+    week_key = current_week_key()
+    if bot_state.get("weekly_lockout_week") == week_key:
+        return JSONResponse(status_code=423, content={"status": "locked", "message": "Weekly drawdown lockout is active until next week."})
+    if bot_state.get("weekly_lockout_week") and bot_state.get("weekly_lockout_week") != week_key:
+        bot_state["weekly_lockout_week"] = None
+        paper_state["week_start_balance"] = None
+        paper_state["consecutive_losses"] = 0
+        save_runtime_state()
     if not bot_state["is_running"]:
         bot_state["is_running"] = True
+        bot_started_at = datetime.now(timezone.utc)
         bot_task = asyncio.create_task(bot_loop())
     return {"status": "started"}
 
@@ -998,6 +1253,12 @@ def toggle_auto():
     today = datetime.now().date().isoformat()
     if bot_state.get("daily_lockout_date") == today:
         return JSONResponse(status_code=423, content={"status": "locked", "auto_trade": False})
+    if bot_state.get("weekly_lockout_week") == current_week_key():
+        return JSONResponse(status_code=423, content={"status": "locked", "auto_trade": False})
+    loss_streak = paper_state["consecutive_losses"] if EXECUTION_MODE != "live" else get_live_consecutive_losses()
+    if loss_streak >= CONFIG.get("maxConsecutiveLosses", 5):
+        return JSONResponse(status_code=423, content={"status": "locked", "auto_trade": False,
+                                                       "message": "Consecutive-loss limit reached."})
     if not bot_state["is_running"]:
         return JSONResponse(status_code=409, content={"status": "stopped", "auto_trade": False})
     bot_state["auto_trade"] = not bot_state["auto_trade"]
@@ -1005,6 +1266,13 @@ def toggle_auto():
 
 @app.post("/api/close_all")
 def close_all_orders():
+    if EXECUTION_MODE != "live" and paper_state.get("position"):
+        tick = mt5.symbol_info_tick(paper_state["position"]["symbol"])
+        if not tick:
+            return JSONResponse(status_code=503, content={"status": "error", "message": "No market tick available."})
+        price = tick.bid if paper_state["position"]["type"] == "BUY" else tick.ask
+        close_paper_position(price, "Manual Web Close")
+        return {"status": "success", "closed": 1}
     positions = get_bot_positions()
     if not positions: return {"status": "no_orders"}
     closed_count = 0
@@ -1025,10 +1293,11 @@ def get_status():
 # ==========================================
 @app.get("/api/logs")
 def get_trade_logs():
-    if not os.path.exists(TRADE_LOG_FILE):
+    log_file = TRADE_LOG_FILE if EXECUTION_MODE == "live" else PAPER_LOG_FILE
+    if not os.path.exists(log_file):
         return {"status": "success", "logs": []}
     try:
-        df = pd.read_csv(TRADE_LOG_FILE)
+        df = pd.read_csv(log_file)
         # ดึง 50 รายการล่าสุด และกลับด้านให้รายการใหม่สุดอยู่บน
         last_logs = df.tail(50).fillna("").to_dict(orient="records")
         last_logs.reverse()

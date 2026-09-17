@@ -19,6 +19,7 @@ def build_m15(rates, point):
     ).dropna()
     m15["spread_price"] = m15["spread"] * point
     m15["atr"] = ta.volatility.AverageTrueRange(m15.high, m15.low, m15.close, window=14).average_true_range()
+    m15["adx"] = ta.trend.ADXIndicator(m15.high, m15.low, m15.close, window=14).adx()
     m15["atr_median"] = m15.atr.rolling(100).median()
     m15["entry_high"] = m15.high.rolling(20).max().shift(1)
     m15["entry_low"] = m15.low.rolling(20).min().shift(1)
@@ -35,7 +36,7 @@ def build_m15(rates, point):
     return m15
 
 
-def run_v2(df, risk_percent=0.5, initial_balance=10_000.0):
+def run_v2(df, risk_percent=0.5, initial_balance=10_000.0, adx_threshold=None):
     balance = initial_balance
     peak = balance
     max_drawdown = 0.0
@@ -80,8 +81,9 @@ def run_v2(df, risk_percent=0.5, initial_balance=10_000.0):
         atr_ratio = bar.atr / bar.atr_median
         regime_ok = 0.75 <= atr_ratio <= 2.0
         cost_ok = 2.0 * bar.atr >= 8.0 * next_bar.spread_price
-        buy = regime_ok and cost_ok and bar.close > bar.entry_high and bar.h1_close > bar.ema200
-        sell = regime_ok and cost_ok and bar.close < bar.entry_low and bar.h1_close < bar.ema200
+        adx_ok = adx_threshold is None or bar.adx >= adx_threshold
+        buy = regime_ok and cost_ok and adx_ok and bar.close > bar.entry_high and bar.h1_close > bar.ema200
+        sell = regime_ok and cost_ok and adx_ok and bar.close < bar.entry_low and bar.h1_close < bar.ema200
         if not buy and not sell:
             continue
 
@@ -103,6 +105,7 @@ def run_v2(df, risk_percent=0.5, initial_balance=10_000.0):
     gross_loss = -sum(min(t["pnl"], 0) for t in trades)
     return {
         "strategy": "M15 Donchian(20/10) + H1 EMA200 + ATR regime",
+        "adx_threshold": adx_threshold,
         "risk_percent": risk_percent,
         "trades": len(trades),
         "wins": wins,
@@ -138,7 +141,11 @@ def main_cli():
             "bars_m15": len(df),
             "first_bar": str(df.index[0]),
             "last_bar": str(df.index[-1]),
-            "result": run_v2(df),
+            "results": [
+                run_v2(df, adx_threshold=None),
+                run_v2(df, adx_threshold=20.0),
+                run_v2(df, adx_threshold=25.0),
+            ],
             "limitations": [
                 "Further out-of-sample and forward testing is required",
                 "Uses broker M15 bars and recorded spread, not real tick sequencing",
