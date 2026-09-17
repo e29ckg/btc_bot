@@ -216,6 +216,21 @@
                             <div><label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">ADX Threshold</label><input type="number" step="0.1" id="c_adxThresh" class="form-input" required></div>
                             <div><label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">Min Wick %</label><input type="number" step="0.1" id="c_minWickPct" class="form-input" required></div>
                         </div>
+                        <div class="mt-4 rounded-lg border border-teal-200 bg-teal-50 p-3">
+                            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
+                                <div>
+                                    <label class="text-[10px] md:text-xs font-bold text-teal-700 uppercase">Strategy Mode</label>
+                                    <select id="c_strategyMode" class="form-input" required>
+                                        <option value="donchian">Donchian</option>
+                                        <option value="legacy">Legacy EMA/ADX</option>
+                                    </select>
+                                </div>
+                                <div><label class="text-[10px] md:text-xs font-bold text-teal-700 uppercase">Donchian Entry</label><input type="number" min="5" max="200" id="c_donchianEntryLen" class="form-input" required></div>
+                                <div><label class="text-[10px] md:text-xs font-bold text-teal-700 uppercase">Donchian Exit</label><input type="number" min="2" max="100" id="c_donchianExitLen" class="form-input" required></div>
+                                <div><label class="text-[10px] md:text-xs font-bold text-teal-700 uppercase">Trend EMA</label><input type="number" min="20" max="500" id="c_trendEmaLen" class="form-input" required></div>
+                            </div>
+                            <p class="mt-2 text-[10px] text-teal-700">Donchian Exit ต้องน้อยกว่า Entry</p>
+                        </div>
                     </div>
 
                     <!-- SECTION 2 -->
@@ -272,6 +287,14 @@
                                 <label class="text-[10px] font-bold text-purple-700 uppercase">Daily Drawdown (%) Stop Bot</label>
                                 <input type="number" step="0.1" id="c_maxDailyDrawdownRisk" class="form-input border-purple-300" required>
                             </div>
+                            <div class="bg-purple-50 p-2 rounded border border-purple-200 md:col-span-2">
+                                <label class="text-[10px] font-bold text-purple-700 uppercase">Weekly Drawdown (%) Lockout</label>
+                                <input type="number" min="0.1" max="20" step="0.1" id="c_maxWeeklyDrawdownRisk" class="form-input border-purple-300" required>
+                            </div>
+                            <div class="bg-orange-50 p-2 rounded border border-orange-200 md:col-span-2">
+                                <label class="text-[10px] font-bold text-orange-700 uppercase">Max Consecutive Losses</label>
+                                <input type="number" min="1" max="20" id="c_maxConsecutiveLosses" class="form-input border-orange-300" required>
+                            </div>
                         </div>
                     </div>
 
@@ -286,6 +309,16 @@
                             <div class="md:col-span-2">
                                 <label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">Max Spread (Points)</label>
                                 <input type="number" step="0.1" id="c_maxSpreadPoints" class="form-input" required>
+                            </div>
+                            <div>
+                                <label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">Spread / SL Max Ratio</label>
+                                <input type="number" min="0.01" max="0.5" step="0.01" id="c_maxSpreadRiskRatio" class="form-input" required>
+                                <span class="text-[10px] text-gray-400">0.10 = 10%</span>
+                            </div>
+                            <div class="grid grid-cols-3 gap-2 md:col-span-3 rounded-lg border border-indigo-200 bg-indigo-50 p-3">
+                                <div><label class="text-[10px] font-bold text-indigo-700 uppercase">ATR Regime Lookback</label><input type="number" min="20" max="500" id="c_atrRegimeLookback" class="form-input" required></div>
+                                <div><label class="text-[10px] font-bold text-indigo-700 uppercase">ATR Regime Min</label><input type="number" min="0.01" max="2" step="0.05" id="c_atrRegimeMin" class="form-input" required></div>
+                                <div><label class="text-[10px] font-bold text-indigo-700 uppercase">ATR Regime Max</label><input type="number" min="0.02" max="5" step="0.05" id="c_atrRegimeMax" class="form-input" required></div>
                             </div>
                             <div class="flex items-center gap-2 border p-2 rounded">
                                 <input type="checkbox" id="c_enableSessionFilter">
@@ -412,6 +445,10 @@
                 document.getElementById('c_adxLen').value = config.adxLen;
                 document.getElementById('c_adxThresh').value = config.adxThresh;
                 document.getElementById('c_minWickPct').value = config.minWickPct;
+                document.getElementById('c_strategyMode').value = config.strategyMode ?? 'donchian';
+                document.getElementById('c_donchianEntryLen').value = config.donchianEntryLen ?? 20;
+                document.getElementById('c_donchianExitLen').value = config.donchianExitLen ?? 10;
+                document.getElementById('c_trendEmaLen').value = config.trendEmaLen ?? 200;
                 document.getElementById('c_atrLen').value = config.atrLen;
                 document.getElementById('c_atrMultiplier').value = config.atrMultiplier;
                 document.getElementById('c_rrRatio').value = config.rrRatio;
@@ -435,9 +472,15 @@
                 document.getElementById('c_maxBasketRisk').value = config.maxBasketRisk || 5.0;
                 document.getElementById('c_hardCutRisk').value = config.hardCutRisk || 6.0;
                 document.getElementById('c_maxDailyDrawdownRisk').value = config.maxDailyDrawdownRisk || 10.0;
+                document.getElementById('c_maxWeeklyDrawdownRisk').value = config.maxWeeklyDrawdownRisk ?? 5.0;
+                document.getElementById('c_maxConsecutiveLosses').value = config.maxConsecutiveLosses ?? 5;
                 
                 document.getElementById('c_enableMTFFilter').checked = config.enableMTFFilter ?? true;
                 document.getElementById('c_maxSpreadPoints').value = config.maxSpreadPoints || 50.0;
+                document.getElementById('c_maxSpreadRiskRatio').value = config.maxSpreadRiskRatio ?? 0.1;
+                document.getElementById('c_atrRegimeLookback').value = config.atrRegimeLookback ?? 100;
+                document.getElementById('c_atrRegimeMin').value = config.atrRegimeMin ?? 0.75;
+                document.getElementById('c_atrRegimeMax').value = config.atrRegimeMax ?? 2.0;
                 document.getElementById('c_enableSessionFilter').checked = config.enableSessionFilter ?? false;
                 document.getElementById('c_sessionStartHour').value = config.sessionStartHour ?? 13;
                 document.getElementById('c_sessionEndHour').value = config.sessionEndHour ?? 23;
@@ -461,6 +504,10 @@
                 adxLen: parseInt(document.getElementById('c_adxLen').value),
                 adxThresh: parseFloat(document.getElementById('c_adxThresh').value),
                 minWickPct: parseFloat(document.getElementById('c_minWickPct').value),
+                strategyMode: document.getElementById('c_strategyMode').value,
+                donchianEntryLen: parseInt(document.getElementById('c_donchianEntryLen').value),
+                donchianExitLen: parseInt(document.getElementById('c_donchianExitLen').value),
+                trendEmaLen: parseInt(document.getElementById('c_trendEmaLen').value),
                 atrLen: parseInt(document.getElementById('c_atrLen').value),
                 atrMultiplier: parseFloat(document.getElementById('c_atrMultiplier').value),
                 rrRatio: parseFloat(document.getElementById('c_rrRatio').value),
@@ -484,9 +531,15 @@
                 maxBasketRisk: parseFloat(document.getElementById('c_maxBasketRisk').value),
                 hardCutRisk: parseFloat(document.getElementById('c_hardCutRisk').value),
                 maxDailyDrawdownRisk: parseFloat(document.getElementById('c_maxDailyDrawdownRisk').value),
+                maxWeeklyDrawdownRisk: parseFloat(document.getElementById('c_maxWeeklyDrawdownRisk').value),
+                maxConsecutiveLosses: parseInt(document.getElementById('c_maxConsecutiveLosses').value),
                 
                 enableMTFFilter: document.getElementById('c_enableMTFFilter').checked,
                 maxSpreadPoints: parseFloat(document.getElementById('c_maxSpreadPoints').value),
+                maxSpreadRiskRatio: parseFloat(document.getElementById('c_maxSpreadRiskRatio').value),
+                atrRegimeLookback: parseInt(document.getElementById('c_atrRegimeLookback').value),
+                atrRegimeMin: parseFloat(document.getElementById('c_atrRegimeMin').value),
+                atrRegimeMax: parseFloat(document.getElementById('c_atrRegimeMax').value),
                 enableSessionFilter: document.getElementById('c_enableSessionFilter').checked,
                 sessionStartHour: parseInt(document.getElementById('c_sessionStartHour').value),
                 sessionEndHour: parseInt(document.getElementById('c_sessionEndHour').value),
