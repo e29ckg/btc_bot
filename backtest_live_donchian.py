@@ -122,6 +122,7 @@ def run_live_rules(df, config, point, initial_balance=10_000.0):
 
 def main_cli():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", default=main.SYMBOL)
     parser.add_argument("--bars", type=int, default=20_000)
     parser.add_argument("--output", default="backtest_live_donchian_results.json")
     parser.add_argument("--entry-timeframe", default=main.TIMEFRAME_STR)
@@ -138,8 +139,8 @@ def main_cli():
     if not mt5.initialize(path=terminal_path):
         raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
     try:
-        mt5.symbol_select(main.SYMBOL, True)
-        info = mt5.symbol_info(main.SYMBOL)
+        mt5.symbol_select(args.symbol, True)
+        info = mt5.symbol_info(args.symbol)
         timeframe_map = {
             "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
             "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
@@ -147,7 +148,7 @@ def main_cli():
         rule_map = {"M5": "5min", "M15": "15min", "M30": "30min", "H1": "1h", "H4": "4h"}
         if args.entry_timeframe not in timeframe_map or args.trend_timeframe not in rule_map:
             raise ValueError("Unsupported entry or trend timeframe")
-        rates = mt5.copy_rates_from_pos(main.SYMBOL, timeframe_map[args.entry_timeframe], 0, args.bars)
+        rates = mt5.copy_rates_from_pos(args.symbol, timeframe_map[args.entry_timeframe], 0, args.bars)
         if rates is None or not len(rates):
             raise RuntimeError(f"No rates: {mt5.last_error()}")
         config = main.CONFIG.copy()
@@ -160,7 +161,7 @@ def main_cli():
         config.update({key: value for key, value in overrides.items() if value is not None})
         df = prepare_data(rates, info.point, config, rule_map[args.trend_timeframe])
         result = {
-            "symbol": main.SYMBOL, "entry_timeframe": args.entry_timeframe,
+            "symbol": args.symbol, "entry_timeframe": args.entry_timeframe,
             "trend_timeframe": args.trend_timeframe, "bars": len(df),
             "first_bar": str(df.index[0]), "last_bar": str(df.index[-1]),
             "config": {key: config[key] for key in overrides},

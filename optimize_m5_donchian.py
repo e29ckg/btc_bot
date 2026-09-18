@@ -11,13 +11,13 @@ import ta
 import main
 
 
-def load_data(bars):
+def load_data(symbol, bars):
     terminal_path = r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe"
     if not mt5.initialize(path=terminal_path):
         raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
-    mt5.symbol_select(main.SYMBOL, True)
-    info = mt5.symbol_info(main.SYMBOL)
-    rates = mt5.copy_rates_from_pos(main.SYMBOL, mt5.TIMEFRAME_M5, 0, bars)
+    mt5.symbol_select(symbol, True)
+    info = mt5.symbol_info(symbol)
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, bars)
     if rates is None or not len(rates):
         raise RuntimeError(f"No M5 rates: {mt5.last_error()}")
     df = pd.DataFrame(rates)
@@ -116,11 +116,12 @@ def simulate(data, start, end, config, initial_balance=10_000.0):
 
 def main_cli():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", default=main.SYMBOL)
     parser.add_argument("--bars", type=int, default=50_000)
     parser.add_argument("--output", default="optimize_m5_donchian_results.json")
     args = parser.parse_args()
     try:
-        df, trend, point = load_data(args.bars)
+        df, trend, point = load_data(args.symbol, args.bars)
         split = int(len(df) * 0.65)
         results = []
         channel_cache = {}
@@ -169,7 +170,7 @@ def main_cli():
         robust = [row for row in results if row["train"]["return_pct"] > 0 and row["test"]["return_pct"] > 0
                   and row["train"]["profit_factor"] > 1 and row["test"]["profit_factor"] > 1]
         report = {
-            "symbol": main.SYMBOL, "bars": len(df), "first_bar": str(df.index[0]),
+            "symbol": args.symbol, "bars": len(df), "first_bar": str(df.index[0]),
             "last_bar": str(df.index[-1]), "split_time": str(df.index[split]),
             "tested_configs": len(results), "robust_configs": len(robust),
             "best_robust": robust[:10], "best_overall": results[:10],
