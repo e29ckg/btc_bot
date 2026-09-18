@@ -7,8 +7,11 @@ env/
 
 #
 trade_log.csv
+paper_trade_log.csv
 runtime_state.json
 backtest*_results.json
+backtest_*.json
+optimize*_results.json
 
 # Python cache
 __pycache__/

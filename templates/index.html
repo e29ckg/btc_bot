@@ -304,7 +304,7 @@
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-3 md:gap-4">
                             <div class="flex items-center gap-2 border p-2 rounded bg-blue-50">
                                 <input type="checkbox" id="c_enableMTFFilter">
-                                <label class="text-[11px] md:text-sm font-bold text-blue-700">MTF H1 Trend Confirmation</label>
+                                <label class="text-[11px] md:text-sm font-bold text-blue-700">Higher-Timeframe Trend Confirmation</label>
                             </div>
                             <div class="md:col-span-2">
                                 <label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">Max Spread (Points)</label>
@@ -566,7 +566,7 @@
                 if(data.runtime) {
                     const modeBadge = document.getElementById('executionModeBadge');
                     const isLive = data.runtime.execution_mode === 'LIVE';
-                    modeBadge.innerText = `${data.runtime.execution_mode} • ${data.market.symbol} • ${data.runtime.timeframe} • ${data.runtime.strategy}`;
+                    modeBadge.innerText = `${data.runtime.execution_mode} • ${data.market.symbol} • ${data.runtime.timeframe} entry / ${data.runtime.trend_timeframe} trend • ${data.runtime.strategy}`;
                     modeBadge.className = isLive
                         ? "text-xs font-extrabold px-3 py-1 rounded-full border-2 border-red-500 text-red-700 bg-red-50"
                         : "text-xs font-extrabold px-3 py-1 rounded-full border-2 border-amber-500 text-amber-700 bg-amber-50";

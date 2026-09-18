@@ -24,6 +24,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = os.getenv("MT5_SYMBOL", "XAUUSD")
 TIMEFRAME_STR = os.getenv("TIMEFRAME", "M1")
+TREND_TIMEFRAME_STR = os.getenv("TREND_TIMEFRAME", "H1")
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "paper").lower()
 DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
@@ -425,22 +426,22 @@ def check_market_filters(proposed_signal: str):
             return False, f"Outside Session Window ({start_h}:00 - {end_h}:00)"
 
     if CONFIG.get("enableMTFFilter", True) and proposed_signal in ["BUY", "SELL"]:
-        h1_window = CONFIG.get("trendEmaLen", 200) if CONFIG.get("strategyMode") == "donchian" else max(CONFIG['emaFastLen'], CONFIG['emaSlowLen'])
-        h1_count = h1_window + 10
-        h1_rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, h1_count)
-        if h1_rates is None or len(h1_rates) < h1_count:
-            return False, "H1 market data unavailable"
-        df_h1 = pd.DataFrame(h1_rates)
+        trend_window = CONFIG.get("trendEmaLen", 200) if CONFIG.get("strategyMode") == "donchian" else max(CONFIG['emaFastLen'], CONFIG['emaSlowLen'])
+        trend_count = trend_window + 10
+        trend_rates = mt5.copy_rates_from_pos(SYMBOL, get_mt5_timeframe(TREND_TIMEFRAME_STR), 0, trend_count)
+        if trend_rates is None or len(trend_rates) < trend_count:
+            return False, f"{TREND_TIMEFRAME_STR} market data unavailable"
+        df_trend = pd.DataFrame(trend_rates)
         if CONFIG.get("strategyMode") == "donchian":
-            h1_ema = ta.trend.ema_indicator(df_h1['close'], window=h1_window).iloc[-2]
-            h1_close = df_h1['close'].iloc[-2]
-            if proposed_signal == "BUY" and h1_close <= h1_ema: return False, "H1 price is below EMA trend filter"
-            if proposed_signal == "SELL" and h1_close >= h1_ema: return False, "H1 price is above EMA trend filter"
+            trend_ema = ta.trend.ema_indicator(df_trend['close'], window=trend_window).iloc[-2]
+            trend_close = df_trend['close'].iloc[-2]
+            if proposed_signal == "BUY" and trend_close <= trend_ema: return False, f"{TREND_TIMEFRAME_STR} price is below EMA trend filter"
+            if proposed_signal == "SELL" and trend_close >= trend_ema: return False, f"{TREND_TIMEFRAME_STR} price is above EMA trend filter"
         else:
-            ema50_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaFastLen']).iloc[-2]
-            ema100_h1 = ta.trend.ema_indicator(df_h1['close'], window=CONFIG['emaSlowLen']).iloc[-2]
-            if proposed_signal == "BUY" and ema50_h1 <= ema100_h1: return False, "H1 Trend is Bearish"
-            elif proposed_signal == "SELL" and ema50_h1 >= ema100_h1: return False, "H1 Trend is Bullish"
+            ema_fast_trend = ta.trend.ema_indicator(df_trend['close'], window=CONFIG['emaFastLen']).iloc[-2]
+            ema_slow_trend = ta.trend.ema_indicator(df_trend['close'], window=CONFIG['emaSlowLen']).iloc[-2]
+            if proposed_signal == "BUY" and ema_fast_trend <= ema_slow_trend: return False, f"{TREND_TIMEFRAME_STR} Trend is Bearish"
+            elif proposed_signal == "SELL" and ema_fast_trend >= ema_slow_trend: return False, f"{TREND_TIMEFRAME_STR} Trend is Bullish"
 
     return True, "Passed All Filters"
 
@@ -1197,7 +1198,7 @@ def get_dashboard_data():
                      "pips": round(diff / point, 1), "profit": round(paper_state["floating_pl"], 2), "bot": "Paper"}]
 
     runtime = {"execution_mode": EXECUTION_MODE.upper(), "strategy": CONFIG.get("strategyMode", "legacy").upper(),
-               "timeframe": TIMEFRAME_STR, "paper": paper_state}
+               "timeframe": TIMEFRAME_STR, "trend_timeframe": TREND_TIMEFRAME_STR, "paper": paper_state}
     return {"sys": sys_data, "acc": acc_data, "bot": bot_state, "market": market_data, "positions": pos_data, "runtime": runtime}
 
 @app.get("/")

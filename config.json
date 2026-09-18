@@ -6,7 +6,7 @@
     "adxThresh": 25.0,
     "minWickPct": 5.0,
     "atrLen": 14,
-    "atrMultiplier": 2.0,
+    "atrMultiplier": 2.5,
     "rrRatio": 2.0,
     "riskPercent": 0.25,
     "magicNumber": 777777,
@@ -39,10 +39,10 @@
     "sessionStartHour": 13,
     "sessionEndHour": 23,
     "strategyMode": "donchian",
-    "donchianEntryLen": 20,
-    "donchianExitLen": 10,
-    "trendEmaLen": 200,
+    "donchianEntryLen": 40,
+    "donchianExitLen": 5,
+    "trendEmaLen": 100,
     "atrRegimeLookback": 100,
-    "atrRegimeMin": 0.75,
+    "atrRegimeMin": 0.9,
     "atrRegimeMax": 2.0
 }
