@@ -103,6 +103,18 @@ master.e29ckg.org {
 
 สั่ง Reload Caddy: `caddy reload`
 
+### Backtest XAUUSDc M1 (3 เดือน / ทุน $1,000)
+
+เปิด MT5 และล็อกอินบัญชีของโบรกเกอร์ที่มีสัญลักษณ์ `XAUUSDc` จากนั้นรัน:
+
+```powershell
+python backtest_xauusdc.py --symbol XAUUSDc --start 2026-06-17 --end 2026-09-17 --balance 1000 --risk-percent 0.25
+```
+
+ผลลัพธ์จะถูกบันทึกใน `backtest_results/xauusdc_m1_summary.json` และ
+`backtest_results/xauusdc_m1_trades.csv` หากบัญชีมีค่าคอมมิชชัน ให้เพิ่ม
+`--commission-per-lot` ตามค่ารอบเปิด-ปิดต่อ 1 lot ของโบรกเกอร์
+
 ---
 
 ## 📈 วิธีการปรับจูน (Fine-Tuning สำหรับ XAUUSD M1)
