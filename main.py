@@ -109,7 +109,7 @@ class ConfigModel(BaseModel):
     newsBeforeMin: int = Field(ge=0, le=240)
     newsAfterMin: int = Field(ge=0, le=240)
     enableMTFFilter: bool
-    maxSpreadPoints: float = Field(gt=0, le=500)
+    maxSpreadPoints: float = Field(gt=0, le=100000)
     maxSpreadRiskRatio: float = Field(default=0.1, gt=0, le=0.5)
     enableSessionFilter: bool
     sessionStartHour: int = Field(ge=0, le=23)
