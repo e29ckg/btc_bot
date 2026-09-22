@@ -239,6 +239,8 @@
                         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
                             <div><label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">ATR Length</label><input type="number" id="c_atrLen" class="form-input" required></div>
                             <div><label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">SL Multiplier</label><input type="number" step="0.1" id="c_atrMultiplier" class="form-input" required></div>
+                            <div><label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">Stop Loss Mode</label><select id="c_stopLossMode" class="form-input" required><option value="wick">Candle Wick</option><option value="atr">ATR Distance</option></select></div>
+                            <div><label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">SL Fee Buffer (Points)</label><input type="number" min="0" step="1" id="c_slBufferPoints" class="form-input" required></div>
                             <div><label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">R:R Ratio (TP)</label><input type="number" step="0.1" id="c_rrRatio" class="form-input" required></div>
                             <div><label class="text-[10px] md:text-xs font-bold text-gray-500 uppercase">First Entry Risk %</label><input type="number" step="0.1" id="c_riskPercent" class="form-input" required></div>
                         </div>
@@ -451,6 +453,8 @@
                 document.getElementById('c_trendEmaLen').value = config.trendEmaLen ?? 200;
                 document.getElementById('c_atrLen').value = config.atrLen;
                 document.getElementById('c_atrMultiplier').value = config.atrMultiplier;
+                document.getElementById('c_stopLossMode').value = config.stopLossMode ?? 'wick';
+                document.getElementById('c_slBufferPoints').value = config.slBufferPoints ?? 25;
                 document.getElementById('c_rrRatio').value = config.rrRatio;
                 document.getElementById('c_riskPercent').value = config.riskPercent;
                 document.getElementById('c_magicNumber').value = config.magicNumber;
@@ -510,6 +514,8 @@
                 trendEmaLen: parseInt(document.getElementById('c_trendEmaLen').value),
                 atrLen: parseInt(document.getElementById('c_atrLen').value),
                 atrMultiplier: parseFloat(document.getElementById('c_atrMultiplier').value),
+                stopLossMode: document.getElementById('c_stopLossMode').value,
+                slBufferPoints: parseFloat(document.getElementById('c_slBufferPoints').value),
                 rrRatio: parseFloat(document.getElementById('c_rrRatio').value),
                 riskPercent: parseFloat(document.getElementById('c_riskPercent').value),
                 magicNumber: parseInt(document.getElementById('c_magicNumber').value),

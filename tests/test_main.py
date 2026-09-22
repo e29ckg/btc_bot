@@ -9,6 +9,51 @@ from starlette.responses import JSONResponse
 
 
 class TradingHelpersTest(unittest.TestCase):
+    def test_structural_stop_is_beyond_closed_candle_and_cost_buffer(self):
+        original = main.CONFIG.copy()
+        try:
+            main.CONFIG["slBufferPoints"] = 25.0
+            tick = SimpleNamespace(bid=4360.000, ask=4360.200)
+            symbol = SimpleNamespace(point=0.001, digits=3)
+            self.assertEqual(main.calculate_signal_stop("BUY", 4358.500, 4361.000, tick, symbol), 4358.275)
+            self.assertEqual(main.calculate_signal_stop("SELL", 4358.500, 4361.000, tick, symbol), 4361.225)
+        finally:
+            main.CONFIG.clear()
+            main.CONFIG.update(original)
+
+    @patch.object(main.mt5, "order_send")
+    @patch.object(main.mt5, "account_info", return_value=SimpleNamespace(balance=4660.0))
+    @patch.object(main, "send_telegram", return_value=True)
+    @patch.object(main, "save_runtime_state")
+    @patch.object(main, "log_paper_trade")
+    def test_execute_trade_opens_paper_order_without_broker_send(
+        self, _log, _save, _telegram, _account, order_send
+    ):
+        original_state = main.paper_state.copy()
+        original_mode = main.EXECUTION_MODE
+        try:
+            main.EXECUTION_MODE = "paper"
+            main.paper_state.update(
+                position=None,
+                realized_pl=0.0,
+                floating_pl=0.0,
+                consecutive_losses=0,
+                week_start_balance=None,
+            )
+            opened = main.execute_trade(
+                "BTCUSDc", main.mt5.ORDER_TYPE_BUY, 0.01,
+                80000.0, 79500.0, 0.0, "Automated paper order test",
+            )
+            self.assertTrue(opened)
+            self.assertEqual(main.paper_state["position"]["symbol"], "BTCUSDc")
+            self.assertEqual(main.paper_state["position"]["type"], "BUY")
+            self.assertEqual(main.paper_state["position"]["volume"], 0.01)
+            order_send.assert_not_called()
+        finally:
+            main.EXECUTION_MODE = original_mode
+            main.paper_state.clear()
+            main.paper_state.update(original_state)
+
     @patch.object(main.mt5, "symbol_info")
     def test_paper_profit_uses_tick_value_for_buy_and_sell(self, symbol_info):
         symbol_info.return_value = SimpleNamespace(trade_tick_size=0.01, trade_tick_value=1.0)

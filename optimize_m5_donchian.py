@@ -11,13 +11,20 @@ import ta
 import main
 
 
-def load_data(symbol, bars):
+def load_data(symbol, bars, entry_timeframe="M5", trend_timeframe="M15"):
     terminal_path = r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe"
     if not mt5.initialize(path=terminal_path):
         raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
     mt5.symbol_select(symbol, True)
     info = mt5.symbol_info(symbol)
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, bars)
+    timeframe_map = {
+        "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
+    }
+    rule_map = {"M5": "5min", "M15": "15min", "M30": "30min", "H1": "1h", "H4": "4h"}
+    if entry_timeframe not in timeframe_map or trend_timeframe not in rule_map:
+        raise ValueError("Unsupported entry or trend timeframe")
+    rates = mt5.copy_rates_from_pos(symbol, timeframe_map[entry_timeframe], 0, bars)
     if rates is None or not len(rates):
         raise RuntimeError(f"No M5 rates: {mt5.last_error()}")
     df = pd.DataFrame(rates)
@@ -26,7 +33,7 @@ def load_data(symbol, bars):
     df["spread_price"] = df.spread * info.point
     df["atr"] = ta.volatility.AverageTrueRange(df.high, df.low, df.close, window=14).average_true_range()
     df["atr_median"] = df.atr.rolling(100).median()
-    trend = df.close.resample("15min", closed="left", label="right").last().dropna().to_frame()
+    trend = df.close.resample(rule_map[trend_timeframe], closed="left", label="right").last().dropna().to_frame()
     return df, trend, info.point
 
 
@@ -96,18 +103,24 @@ def simulate(data, start, end, config, initial_balance=10_000.0):
 
         if i < start or not np.isfinite(bar[5:13]).all() or bar[6] <= 0:
             continue
-        initial_risk = bar[5] * config["atr_multiplier"]
         atr_ratio = bar[5] / bar[6]
-        spread_ok = bar[4] / initial_risk <= main.CONFIG["maxSpreadRiskRatio"]
         regime_ok = config["atr_min"] <= atr_ratio <= main.CONFIG["atrRegimeMax"]
-        buy = regime_ok and spread_ok and bar[3] > bar[9] and bar[11] > bar[12]
-        sell = regime_ok and spread_ok and bar[3] < bar[10] and bar[11] < bar[12]
+        buy = regime_ok and bar[3] > bar[9] and bar[11] > bar[12]
+        sell = regime_ok and bar[3] < bar[10] and bar[11] < bar[12]
         if not buy and not sell:
             continue
         next_bar = data[i + 1]
         side = 1 if buy else -1
         entry = next_bar[0] + next_bar[4] if buy else next_bar[0]
-        stop = entry - initial_risk if buy else entry + initial_risk
+        if main.CONFIG.get("stopLossMode", "atr") == "wick":
+            fee_buffer = next_bar[4] + config["sl_buffer_price"]
+            stop = bar[2] - fee_buffer if buy else bar[1] + fee_buffer
+            initial_risk = entry - stop if buy else stop - entry
+        else:
+            initial_risk = bar[5] * config["atr_multiplier"]
+            stop = entry - initial_risk if buy else entry + initial_risk
+        if initial_risk <= 0 or next_bar[4] / initial_risk > main.CONFIG["maxSpreadRiskRatio"]:
+            continue
         risk_amount = balance * main.CONFIG["riskPercent"] / 100
         position = (side, entry, stop, initial_risk, risk_amount)
 
@@ -117,11 +130,13 @@ def simulate(data, start, end, config, initial_balance=10_000.0):
 def main_cli():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", default=main.SYMBOL)
+    parser.add_argument("--entry-timeframe", default="M5")
+    parser.add_argument("--trend-timeframe", default="M15")
     parser.add_argument("--bars", type=int, default=50_000)
     parser.add_argument("--output", default="optimize_m5_donchian_results.json")
     args = parser.parse_args()
     try:
-        df, trend, point = load_data(args.symbol, args.bars)
+        df, trend, point = load_data(args.symbol, args.bars, args.entry_timeframe, args.trend_timeframe)
         split = int(len(df) * 0.65)
         results = []
         channel_cache = {}
@@ -159,6 +174,7 @@ def main_cli():
                 "atr_multiplier": atr_mult, "atr_min": atr_min,
                 "trail_start": trail_start, "trail_distance": trail_dist,
                 "be_points_price": main.CONFIG["beProfitPoints"] * point,
+                "sl_buffer_price": main.CONFIG.get("slBufferPoints", 25.0) * point,
             }
             train = simulate(data, 300, split, config)
             test = simulate(data, split, len(data), config)
@@ -170,7 +186,8 @@ def main_cli():
         robust = [row for row in results if row["train"]["return_pct"] > 0 and row["test"]["return_pct"] > 0
                   and row["train"]["profit_factor"] > 1 and row["test"]["profit_factor"] > 1]
         report = {
-            "symbol": args.symbol, "bars": len(df), "first_bar": str(df.index[0]),
+            "symbol": args.symbol, "entry_timeframe": args.entry_timeframe,
+            "trend_timeframe": args.trend_timeframe, "bars": len(df), "first_bar": str(df.index[0]),
             "last_bar": str(df.index[-1]), "split_time": str(df.index[split]),
             "tested_configs": len(results), "robust_configs": len(robust),
             "best_robust": robust[:10], "best_overall": results[:10],

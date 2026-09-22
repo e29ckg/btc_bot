@@ -86,18 +86,25 @@ def run_live_rules(df, config, point, initial_balance=10_000.0):
             continue
         atr_ratio = bar.atr / bar.atr_median
         regime_ok = config["atrRegimeMin"] <= atr_ratio <= config["atrRegimeMax"]
-        initial_risk = bar.atr * config["atrMultiplier"]
-        spread_ok = (bar.spread <= config["maxSpreadPoints"] and initial_risk > 0
-                     and bar.spread_price / initial_risk <= config.get("maxSpreadRiskRatio", 0.1))
-        buy = regime_ok and spread_ok and bar.close > bar.entry_high and bar.trend_close > bar.trend_ema
-        sell = regime_ok and spread_ok and bar.close < bar.entry_low and bar.trend_close < bar.trend_ema
+        buy = regime_ok and bar.close > bar.entry_high and bar.trend_close > bar.trend_ema
+        sell = regime_ok and bar.close < bar.entry_low and bar.trend_close < bar.trend_ema
         if not buy and not sell:
             continue
 
         next_bar = df.iloc[i + 1]
         side = "BUY" if buy else "SELL"
         entry = next_bar.open + next_bar.spread_price if buy else next_bar.open
-        stop = entry - initial_risk if buy else entry + initial_risk
+        if config.get("stopLossMode", "atr") == "wick":
+            fee_buffer = next_bar.spread_price + config.get("slBufferPoints", 25.0) * point
+            stop = bar.low - fee_buffer if buy else bar.high + fee_buffer
+            initial_risk = entry - stop if buy else stop - entry
+        else:
+            initial_risk = bar.atr * config["atrMultiplier"]
+            stop = entry - initial_risk if buy else entry + initial_risk
+        spread_ok = (next_bar.spread <= config["maxSpreadPoints"] and initial_risk > 0
+                     and next_bar.spread_price / initial_risk <= config.get("maxSpreadRiskRatio", 0.1))
+        if not spread_ok:
+            continue
         position = {
             "side": side, "entry": float(entry), "stop": float(stop),
             "initial_risk": float(initial_risk),

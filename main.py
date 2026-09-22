@@ -38,6 +38,7 @@ CONFIG = {
     "emaFastLen": 50, "emaSlowLen": 100, "emaEntryLen": 8,
     "adxLen": 14, "adxThresh": 25.0, "minWickPct": 5.0,
     "atrLen": 14, "atrMultiplier": 1.5, "rrRatio": 2.0, "riskPercent": 1.0,
+    "stopLossMode": "wick", "slBufferPoints": 25.0,
     "magicNumber": 777777,
     "enableBE": True, "beTriggerATR": 2.0, "beProfitPoints": 20.0,
     "enableTrailing": True, "trailStartATR": 3.0, "trailDistanceATR": 1.0,
@@ -86,6 +87,8 @@ class ConfigModel(BaseModel):
     minWickPct: float = Field(ge=0, le=100)
     atrLen: int = Field(ge=2, le=200)
     atrMultiplier: float = Field(gt=0, le=20)
+    stopLossMode: str = Field(default="wick", pattern="^(atr|wick)$")
+    slBufferPoints: float = Field(default=25.0, ge=0, le=100000)
     rrRatio: float = Field(gt=0, le=20)
     riskPercent: float = Field(gt=0, le=2)
     magicNumber: int = Field(gt=0)
@@ -383,6 +386,13 @@ def get_mt5_timeframe(tf_str):
 
 def timeframe_seconds(tf_str):
     return {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}.get(tf_str, 900)
+
+def calculate_signal_stop(signal, candle_low, candle_high, tick, sym_info):
+    """Place a structural stop beyond the closed signal candle and cost buffer."""
+    spread_price = tick.ask - tick.bid
+    buffer_price = spread_price + CONFIG.get("slBufferPoints", 25.0) * sym_info.point
+    stop = candle_low - buffer_price if signal == "BUY" else candle_high + buffer_price
+    return round(stop, sym_info.digits)
 
 def required_rate_count():
     """Return enough closed candles for every configured indicator."""
@@ -911,8 +921,12 @@ def analyze_data():
     if is_filter_passed and raw_signal in ["BUY", "SELL"]:
         sym_info = mt5.symbol_info(SYMBOL)
         tick = mt5.symbol_info_tick(SYMBOL)
-        sl_distance = curr['atr'] * CONFIG['atrMultiplier']
         spread_price = tick.ask - tick.bid if tick else float("inf")
+        if CONFIG.get("stopLossMode", "atr") == "wick" and tick:
+            planned_sl = calculate_signal_stop(raw_signal, curr['low'], curr['high'], tick, sym_info)
+            sl_distance = tick.ask - planned_sl if raw_signal == "BUY" else planned_sl - tick.bid
+        else:
+            sl_distance = curr['atr'] * CONFIG['atrMultiplier']
         max_ratio = CONFIG.get("maxSpreadRiskRatio", 0.1)
         if not sym_info or sl_distance <= 0 or spread_price / sl_distance > max_ratio:
             is_filter_passed = False
@@ -924,13 +938,19 @@ def analyze_data():
     tp_price, sl_price, lot_size = 0.0, 0.0, 0.0
     if final_signal != "WAIT":
         sym_info = mt5.symbol_info(SYMBOL)
-        if sym_info:
-            sl_dist = curr['atr'] * CONFIG['atrMultiplier']
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if sym_info and tick:
+            spread_price = tick.ask - tick.bid
+            if CONFIG.get("stopLossMode", "atr") == "wick":
+                sl_price = calculate_signal_stop(final_signal, curr['low'], curr['high'], tick, sym_info)
+                entry_reference = tick.ask if final_signal == "BUY" else tick.bid
+                sl_dist = entry_reference - sl_price if final_signal == "BUY" else sl_price - entry_reference
+            else:
+                sl_dist = curr['atr'] * CONFIG['atrMultiplier']
+                entry_reference = tick.ask if final_signal == "BUY" else tick.bid
+                sl_price = entry_reference - sl_dist if final_signal == "BUY" else entry_reference + sl_dist
             sl_points = sl_dist / sym_info.point if sym_info.point > 0 else 0
-            if final_signal == "BUY":
-                sl_price, tp_price = curr['close'] - sl_dist, curr['close'] + (sl_dist * CONFIG['rrRatio'])
-            elif final_signal == "SELL":
-                sl_price, tp_price = curr['close'] + sl_dist, curr['close'] - (sl_dist * CONFIG['rrRatio'])
+            tp_price = entry_reference + sl_dist * CONFIG['rrRatio'] if final_signal == "BUY" else entry_reference - sl_dist * CONFIG['rrRatio']
             if CONFIG.get("strategyMode") == "donchian":
                 tp_price = 0.0
             lot_size = calculate_lot_size(SYMBOL, sl_points, CONFIG['riskPercent'])
@@ -1092,10 +1112,16 @@ async def bot_loop():
                         await asyncio.sleep(2)
                         continue
                     curr_price = tick.ask if signal == "BUY" else tick.bid
-                    sl_distance = bot_state["sl_distance"]
-                    sl_price = curr_price - sl_distance if signal == "BUY" else curr_price + sl_distance
+                    sl_price = bot_state["sl"]
+                    sl_distance = curr_price - sl_price if signal == "BUY" else sl_price - curr_price
+                    sym_info = await asyncio.to_thread(mt5.symbol_info, SYMBOL)
+                    if not sym_info or sl_distance <= 0:
+                        await asyncio.to_thread(send_telegram, "⚠️ *SIGNAL IGNORED*\nPrice moved beyond the structural stop.")
+                        await asyncio.sleep(2)
+                        continue
+                    live_lot = await asyncio.to_thread(calculate_lot_size, SYMBOL, sl_distance / sym_info.point, CONFIG["riskPercent"])
                     tp_price = 0.0 if CONFIG.get("strategyMode") == "donchian" else (curr_price + sl_distance * CONFIG["rrRatio"] if signal == "BUY" else curr_price - sl_distance * CONFIG["rrRatio"])
-                    await asyncio.to_thread(execute_trade, SYMBOL, action, bot_state["lot"], curr_price, sl_price, tp_price, "Master7 First Entry")
+                    await asyncio.to_thread(execute_trade, SYMBOL, action, live_lot, curr_price, sl_price, tp_price, "Master7 First Entry")
                 else:
                     await asyncio.to_thread(send_telegram, "⚠️ *SIGNAL IGNORED*\nบอทยังมีออเดอร์ค้างอยู่ ข้ามการเปิดไม้ใหม่")
             await asyncio.sleep(60)
